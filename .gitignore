@@ -37,3 +37,11 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 .nox/
+# Credentials — this repo is public. Never commit these.
+google-ads.yaml
+.env
+.env.*
+client_secret*.json
+*-service-account*.json
+credentials.json
+token.json
