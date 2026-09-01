@@ -59,16 +59,38 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 file here. `.gitignore` already covers `google-ads.yaml`, `.env`,
 `client_secret*.json`, `credentials.json`, `token.json`.
 
-## Account setup (in progress)
+## Account setup (done — 1 September 2026)
 
-- Manager (MCC) account: **not created yet** — currency TRY, time zone
-  Europe/Istanbul, both permanent once set.
-- Developer token: **not applied for yet**. Test access is instant; Basic
-  access takes ~5 business days and is enough (15,000 operations/day).
-- Test accounts need their own separate test manager hierarchy; they never
-  serve ads or spend, and their metrics are always empty.
-- Scope: MD Kampüs's own account plus a handful of client accounts (≤5 for
-  now). Under $10k/month spend an MCC allows 50 active accounts.
+| Thing | Value |
+|---|---|
+| Production manager (MCC) | **<production MCC>** "Bayar Reklam" — TRY, Europe/Istanbul |
+| Developer token | Issued, **Test access level**. Basic Access applied for 1 Sep 2026, ~5 business days |
+| Google Cloud project | `md-kampus` / number **<cloud project number>** — Google Ads API enabled |
+| OAuth consent screen | **In production** (published), External. This removes the 7-day refresh-token expiry that Testing status imposes |
+| OAuth client | Web application, created in the same project |
+| Test manager | **<test manager>** "Google Ads MCP", under <test-account owner, see private note> |
+| Test account | **<test account>** "MD Kampus Test" — TRY, Europe/Istanbul |
+
+Test and production are separate hierarchies and never interact. Against test
+accounts you still use the PRODUCTION developer token — that is Google's rule,
+not a mistake. Only `GOOGLE_ADS_LOGIN_CUSTOMER_ID` and the OAuth user change:
+
+    # testing today, with the Test-level token
+    GOOGLE_ADS_LOGIN_CUSTOMER_ID=<test manager>   # the TEST manager
+    customer_id passed to tools = <test account>  # the TEST account
+    OAuth sign-in = <test-account owner, see private note>
+
+    # after Basic access arrives
+    GOOGLE_ADS_LOGIN_CUSTOMER_ID=<production MCC>   # the production MCC
+    OAuth sign-in = <production owner, see private note>
+
+The OAuth client needs `http://localhost:8080/auth/callback` in its authorized
+redirect URIs for local runs (FastMCP GoogleProvider's default).
+
+Scope declared to Google in the Basic Access application, which the tools must
+not exceed without telling Google first: campaign type **Search only**;
+capabilities **Campaign Creation, Campaign Management, Reporting**. Not Account
+Creation, not Account Management, not Keyword Planning Services.
 
 ## Still to build
 
