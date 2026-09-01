@@ -11,3 +11,4 @@ namespaces:
   adgroups: true
   conversions: true
   extensions: true
+  reports: true

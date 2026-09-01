@@ -55,6 +55,7 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 | Module | Namespace | Contents |
 |---|---|---|
 | `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting, ad schedule, location lookup |
+| `reports.py` | `reports` | campaign list, performance, structure, search terms, wasted spend |
 | `extensions.py` | `extensions` | sitelinks, callouts, structured snippets |
 | `conversions.py` | `conversions` | conversion actions, tag snippets, campaign conversion goals |
 | `adgroups.py` | `adgroups` | ad groups, responsive search ads and their text, ad status, keywords and their bids/match types/status, negative keywords |
@@ -134,7 +135,6 @@ These cost a debugging session each. Check them in every new tool.
 
 ## Still to build
 
-- Reporting shortcuts (phase 4): thin GAQL wrappers, no server-side AI
 - Keyword research (phase 5): `KeywordPlanIdeaService`
 - Performance Max and other campaign types (phase 6)
 - Deploy to Cloud Run (`min_instances=0`), add as a custom connector in Claude
