@@ -55,6 +55,7 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 | Module | Namespace | Contents |
 |---|---|---|
 | `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting, ad schedule, location lookup |
+| `keyword_research.py` | `keyword_research` | search volume, competition, top-of-page bid ranges |
 | `reports.py` | `reports` | campaign list, performance, structure, search terms, wasted spend |
 | `extensions.py` | `extensions` | sitelinks, callouts, structured snippets |
 | `conversions.py` | `conversions` | conversion actions, tag snippets, campaign conversion goals |
@@ -135,7 +136,6 @@ These cost a debugging session each. Check them in every new tool.
 
 ## Still to build
 
-- Keyword research (phase 5): `KeywordPlanIdeaService`
 - Performance Max and other campaign types (phase 6)
 - Deploy to Cloud Run (`min_instances=0`), add as a custom connector in Claude
 - Upstream has a merged PR documenting `login-customer-id` on Cloud Run —

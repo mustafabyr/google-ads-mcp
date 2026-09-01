@@ -12,3 +12,4 @@ namespaces:
   conversions: true
   extensions: true
   reports: true
+  keyword_research: true
