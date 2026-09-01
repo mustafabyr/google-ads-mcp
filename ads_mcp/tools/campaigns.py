@@ -311,11 +311,15 @@ def create_search_campaign(
     elif strategy == "TARGET_CPA":
         if target_cpa is None:
             raise ValueError("TARGET_CPA requires target_cpa.")
-        campaign.target_cpa.target_cpa_micros = _to_micros(target_cpa)
+        # Target CPA is Maximize Conversions with a target, not a strategy of
+        # its own; the standalone TargetCpa is rejected on Search campaigns.
+        campaign.maximize_conversions.target_cpa_micros = _to_micros(
+            target_cpa
+        )
     elif strategy == "TARGET_ROAS":
         if target_roas is None:
             raise ValueError("TARGET_ROAS requires target_roas.")
-        campaign.target_roas.target_roas = target_roas
+        campaign.maximize_conversion_value.target_roas = target_roas
     else:
         raise ValueError(f"Unknown bidding strategy: {bidding_strategy}")
 
@@ -888,13 +892,19 @@ def update_bid_strategy(
     elif strategy == "TARGET_CPA":
         if target_cpa is None:
             raise ValueError("TARGET_CPA requires target_cpa.")
-        campaign.target_cpa.target_cpa_micros = _to_micros(target_cpa)
-        path = "target_cpa.target_cpa_micros"
+        # Target CPA is no longer a strategy of its own: it is Maximize
+        # Conversions with a target. The standalone TargetCpa is rejected on
+        # Search campaigns with OPERATION_NOT_PERMITTED_FOR_CONTEXT.
+        campaign.maximize_conversions.target_cpa_micros = _to_micros(
+            target_cpa
+        )
+        path = "maximize_conversions.target_cpa_micros"
     elif strategy == "TARGET_ROAS":
         if target_roas is None:
             raise ValueError("TARGET_ROAS requires target_roas.")
-        campaign.target_roas.target_roas = target_roas
-        path = "target_roas.target_roas"
+        # Likewise: Target ROAS is Maximize Conversion Value with a target.
+        campaign.maximize_conversion_value.target_roas = target_roas
+        path = "maximize_conversion_value.target_roas"
     else:
         raise ValueError(f"Unknown bidding strategy: {bidding_strategy}")
 

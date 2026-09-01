@@ -9,3 +9,4 @@ namespaces:
   metadata: true
   campaigns: true
   adgroups: true
+  conversions: true
