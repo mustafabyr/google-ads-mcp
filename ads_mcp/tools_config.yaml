@@ -13,3 +13,4 @@ namespaces:
   extensions: true
   reports: true
   keyword_research: true
+  pmax: true

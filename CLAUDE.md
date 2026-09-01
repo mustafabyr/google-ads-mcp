@@ -55,6 +55,7 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 | Module | Namespace | Contents |
 |---|---|---|
 | `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting, ad schedule, location lookup |
+| `pmax.py` | `pmax` | Performance Max campaigns, asset groups, image assets, signals |
 | `keyword_research.py` | `keyword_research` | search volume, competition, top-of-page bid ranges |
 | `reports.py` | `reports` | campaign list, performance, structure, search terms, wasted spend |
 | `extensions.py` | `extensions` | sitelinks, callouts, structured snippets |
@@ -128,6 +129,16 @@ These cost a debugging session each. Check them in every new tool.
   action; Google derives it from the category.
 - A GAQL query must SELECT any field it filters on. `FROM campaign_asset
   WHERE campaign.id = X` fails unless `campaign.id` is also selected.
+- Performance Max has to be built in ONE atomic `GoogleAdsService.mutate`
+  with temporary negative resource names. Brand Guidelines is on by default
+  and makes Google check, at campaign-create time, that a business name and
+  logo are already linked as CampaignAssets — which cannot exist before the
+  campaign. Temporary names break that cycle.
+- In that atomic request, TEXT assets must be created beforehand with real
+  resource names. Google does not resolve a temporary asset name when
+  validating the asset group that references it; it reports
+  `NOT_ENOUGH_HEADLINE_ASSET` instead, which points at the wrong problem.
+- `url_expansion_opt_out` no longer exists on Campaign in v25.
 - Target CPA and Target ROAS are no longer strategies of their own. Target CPA
   is `maximize_conversions.target_cpa_micros`; Target ROAS is
   `maximize_conversion_value.target_roas`. The standalone `target_cpa` /
@@ -136,7 +147,10 @@ These cost a debugging session each. Check them in every new tool.
 
 ## Still to build
 
-- Performance Max and other campaign types (phase 6)
+- Demand Gen and YouTube campaign types
+- Audience creation — `add_pmax_audience_signal` consumes audiences but
+  nothing here makes them, and the test account has none, so that one path is
+  verified only as far as the API error.
 - Deploy to Cloud Run (`min_instances=0`), add as a custom connector in Claude
 - Upstream has a merged PR documenting `login-customer-id` on Cloud Run —
   read it before deploying
