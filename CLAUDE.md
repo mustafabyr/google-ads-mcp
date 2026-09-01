@@ -21,13 +21,24 @@ Enforced in code, not by convention. Every tool added here must keep it.
 2. **Enabling a campaign or raising a budget requires `confirm_spend=True`.**
    The refusal is an exception carrying the daily and implied monthly figures,
    so the user can be shown real numbers before agreeing.
-3. **Lowering a budget and pausing never need confirmation** — stopping spend
-   is always safe.
-4. **Removal requires `confirm_remove=True`** and a statement of what is lost.
-5. **Every write reads the object back** and returns its real post-write
-   state, never the intended state.
-6. Spend is gated at the CAMPAIGN level only. Ad groups, ads and keywords are
-   created ENABLED underneath a paused campaign — one clear gate, not several.
+3. **Raising any bid requires `confirm_spend=True`** — ad group CPC, keyword
+   CPC and device bid modifiers all raise cost per click. So does changing the
+   bidding strategy of a campaign that is currently ENABLED, and moving a
+   campaign to a larger budget.
+4. **Lowering a budget or a bid, and pausing anything, never need
+   confirmation** — stopping spend is always safe.
+5. **Removal requires `confirm_remove=True`** and a statement of what is lost.
+   This includes removing a NEGATIVE keyword, which re-opens blocked traffic,
+   and changing a keyword's match type, which Google can only do by removing
+   and re-adding the keyword — its history is discarded.
+6. **Every write reads the object back** and returns its real post-write
+   state, never the intended state. Read-backs return enum NAMES, not the raw
+   integers proto-plus defaults to: a model reading `"status": 3` learns
+   nothing, and the status gates compare against the name.
+7. Creation is gated at the CAMPAIGN level only. Ad groups, ads and keywords
+   are created ENABLED underneath a paused campaign — one clear gate, not
+   several. Bids are gated separately, because they raise cost per click
+   regardless of which campaign they sit under.
 
 ## Money units
 
@@ -43,8 +54,8 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 
 | Module | Namespace | Contents |
 |---|---|---|
-| `campaigns.py` | `campaigns` | budgets, search campaigns, status, geo targeting, ad schedule, location lookup |
-| `adgroups.py` | `adgroups` | ad groups, responsive search ads, keywords, negative keywords |
+| `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting, ad schedule, location lookup |
+| `adgroups.py` | `adgroups` | ad groups, responsive search ads and their text, ad status, keywords and their bids/match types/status, negative keywords |
 | `core.py`, `search.py`, `get_resource_metadata.py` | — | Google's originals, unmodified |
 
 ## Environment
@@ -92,10 +103,28 @@ not exceed without telling Google first: campaign type **Search only**;
 capabilities **Campaign Creation, Campaign Management, Reporting**. Not Account
 Creation, not Account Management, not Keyword Planning Services.
 
+## Google Ads API v25 traps, all hit for real
+
+These cost a debugging session each. Check them in every new tool.
+
+- `FieldMask` is a protobuf well-known type, **not** a Google Ads type:
+  `client.get_type("FieldMask")` fails. Use
+  `field_mask_pb2.FieldMask(paths=[...])`.
+- An update mask must name a **leaf** field. Masking a message that has
+  subfields (`target_spend`, `maximize_conversions`) is rejected with
+  `FIELD_HAS_SUBFIELDS`; mask `target_spend.cpc_bid_ceiling_micros` instead.
+- proto-plus messages have no `CopyFrom`. Use `client.copy_from(dst, src)`.
+- `campaign.start_date` / `end_date` are now `start_date_time` /
+  `end_date_time`, format `"yyyy-MM-dd HH:mm:ss"` in the account's time zone,
+  on both the write and the read side.
+- `contains_eu_political_advertising` is required on every campaign create.
+- A keyword's match type is immutable. Changing it means remove + re-create,
+  which loses history and issues a new criterion id.
+
 ## Still to build
 
-- Test the write tools end-to-end against a test account
-- Conversion tracking tools
+- Conversion tracking tools (phase 2) — the reason `MAXIMIZE_CONVERSIONS`
+  fails today with `CONVERSION_TRACKING_NOT_ENABLED`
 - Deploy to Cloud Run (`min_instances=0`), add as a custom connector in Claude
 - Upstream has a merged PR documenting `login-customer-id` on Cloud Run —
   read it before deploying

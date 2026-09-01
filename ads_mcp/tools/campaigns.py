@@ -26,7 +26,10 @@ SAFETY CONTRACT (enforced in code, not merely by convention):
 
 from typing import Any, Dict, List, Optional
 
+import proto
+
 from fastmcp import FastMCP
+from google.protobuf import field_mask_pb2
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
@@ -75,7 +78,12 @@ def _read_back(customer_id: str, query: str) -> List[Dict[str, Any]]:
     rows = []
     for batch in ga_service.search_stream(customer_id=customer_id, query=query):
         for row in batch.results:
-            rows.append(utils.format_output_value(row))
+            # Enum NAMES, not the raw integers proto-plus defaults to: this
+            # output is read by a model, and "status": 3 tells it nothing.
+            # Status gates elsewhere in this module compare against the name.
+            rows.append(
+                proto.Message.to_dict(row, use_integers_for_enums=False)
+            )
     return rows
 
 
@@ -202,7 +210,7 @@ def update_campaign_budget(
     operation.update.amount_micros = new_micros
     client.copy_from(
         operation.update_mask,
-        client.get_type("FieldMask")(paths=["amount_micros"]),
+        field_mask_pb2.FieldMask(paths=["amount_micros"]),
     )
     service.mutate_campaign_budgets(
         customer_id=customer_id, operations=[operation]
@@ -282,15 +290,23 @@ def create_search_campaign(
     campaign.network_settings.target_google_search = True
     campaign.network_settings.target_search_network = search_network
     campaign.network_settings.target_content_network = content_network
+    # Required by API v25 on every campaign create. This server does not
+    # create political advertising.
+    campaign.contains_eu_political_advertising = (
+        client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
+    )
 
     strategy = bidding_strategy.upper()
     if strategy == "MANUAL_CPC":
         campaign.manual_cpc.enhanced_cpc_enabled = False
     elif strategy == "MAXIMIZE_CLICKS":
-        campaign.target_spend.CopyFrom(client.get_type("TargetSpend"))
+        client.copy_from(
+            campaign.target_spend, client.get_type("TargetSpend")
+        )
     elif strategy == "MAXIMIZE_CONVERSIONS":
-        campaign.maximize_conversions.CopyFrom(
-            client.get_type("MaximizeConversions")
+        client.copy_from(
+            campaign.maximize_conversions,
+            client.get_type("MaximizeConversions"),
         )
     elif strategy == "TARGET_CPA":
         if target_cpa is None:
@@ -304,9 +320,9 @@ def create_search_campaign(
         raise ValueError(f"Unknown bidding strategy: {bidding_strategy}")
 
     if start_date:
-        campaign.start_date = start_date.replace("-", "")
+        campaign.start_date_time = f"{start_date} 00:00:00"
     if end_date:
-        campaign.end_date = end_date.replace("-", "")
+        campaign.end_date_time = f"{end_date} 23:59:59"
 
     response = service.mutate_campaigns(
         customer_id=customer_id, operations=[operation]
@@ -329,7 +345,7 @@ def create_search_campaign(
             SELECT campaign.id, campaign.name, campaign.status,
                    campaign.advertising_channel_type,
                    campaign.bidding_strategy_type,
-                   campaign.start_date, campaign.end_date,
+                   campaign.start_date_time, campaign.end_date_time,
                    campaign_budget.amount_micros
             FROM campaign WHERE campaign.id = {campaign_id}
             """,
@@ -405,7 +421,7 @@ def set_campaign_status(
         client.enums.CampaignStatusEnum, status
     )
     client.copy_from(
-        operation.update_mask, client.get_type("FieldMask")(paths=["status"])
+        operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
     )
     service.mutate_campaigns(customer_id=customer_id, operations=[operation])
 
@@ -623,6 +639,402 @@ def set_campaign_ad_schedule(
             FROM campaign_criterion
             WHERE campaign.id = {campaign_id}
               AND campaign_criterion.type = AD_SCHEDULE
+            """,
+        ),
+    }
+
+
+# --------------------------------------------------------------------------
+# Campaign settings and bidding
+# --------------------------------------------------------------------------
+
+
+def _campaign_is_serving(row: Dict[str, Any]) -> bool:
+    """True when the campaign is ENABLED, i.e. able to spend right now."""
+    return str(row["campaign"].get("status")) == "ENABLED"
+
+
+@campaigns_mcp.tool
+def update_campaign(
+    customer_id: str,
+    campaign_id: str,
+    name: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    search_network: Optional[bool] = None,
+    content_network: Optional[bool] = None,
+    budget_resource_name: Optional[str] = None,
+    confirm_spend: bool = False,
+) -> Dict[str, Any]:
+    """Changes a campaign's settings. Status is not changed here.
+
+    Use set_campaign_status to enable, pause or remove a campaign; this tool
+    only touches settings, so it can never start a campaign serving.
+
+    Moving the campaign to a LARGER budget raises what it can spend and
+    requires confirm_spend=True. Everything else here is capped by the budget
+    that is already in place and needs no confirmation.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        name: New campaign name. Omit to keep.
+        start_date: YYYY-MM-DD. Omit to keep. Cannot be changed once the
+            campaign has started serving.
+        end_date: YYYY-MM-DD. Omit to keep.
+        search_network: Include Google search partners. Omit to keep.
+        content_network: Include the Display network. Omit to keep. Turning
+            this on for a search campaign is a classic way to waste budget.
+        budget_resource_name: Move the campaign to a different budget, e.g.
+            "customers/123/campaignBudgets/456". Omit to keep.
+        confirm_spend: Required only when moving to a larger budget.
+
+    Returns:
+        What changed, and the campaign read back.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+
+    if all(
+        v is None
+        for v in (
+            name,
+            start_date,
+            end_date,
+            search_network,
+            content_network,
+            budget_resource_name,
+        )
+    ):
+        raise ValueError("Give at least one setting to change.")
+
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign.network_settings.target_search_network,
+               campaign.network_settings.target_content_network,
+               campaign.campaign_budget,
+               campaign_budget.amount_micros
+        FROM campaign WHERE campaign.id = {campaign_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No campaign {campaign_id} in account {customer_id}.")
+
+    old_daily = _from_micros(
+        int(current[0]["campaign_budget"]["amount_micros"])
+    )
+
+    if budget_resource_name:
+        new_budget_id = budget_resource_name.rsplit("/", 1)[-1]
+        new_budget = _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_budget.id, campaign_budget.amount_micros
+            FROM campaign_budget WHERE campaign_budget.id = {new_budget_id}
+            """,
+        )
+        if not new_budget:
+            raise ValueError(
+                f"No budget {new_budget_id} in account {customer_id}."
+            )
+        new_daily = _from_micros(
+            int(new_budget[0]["campaign_budget"]["amount_micros"])
+        )
+        if new_daily > old_daily and not confirm_spend:
+            raise SpendConfirmationRequired(
+                f"Moving '{current[0]['campaign']['name']}' to this budget "
+                f"raises its daily cap from {old_daily} to {new_daily} "
+                f"(about {round((new_daily - old_daily) * 30.4, 2)} more per "
+                f"month) in the account's currency. Show these numbers to the "
+                f"user and call again with confirm_spend=True only after they "
+                f"agree."
+            )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignService")
+    operation = client.get_type("CampaignOperation")
+    campaign = operation.update
+    campaign.resource_name = service.campaign_path(customer_id, campaign_id)
+
+    paths = []
+    if name is not None:
+        campaign.name = name
+        paths.append("name")
+    if start_date is not None:
+        campaign.start_date_time = f"{start_date} 00:00:00"
+        paths.append("start_date_time")
+    if end_date is not None:
+        campaign.end_date_time = f"{end_date} 23:59:59"
+        paths.append("end_date_time")
+    if search_network is not None:
+        campaign.network_settings.target_search_network = search_network
+        paths.append("network_settings.target_search_network")
+    if content_network is not None:
+        campaign.network_settings.target_content_network = content_network
+        paths.append("network_settings.target_content_network")
+    if budget_resource_name is not None:
+        campaign.campaign_budget = budget_resource_name
+        paths.append("campaign_budget")
+
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
+    )
+    service.mutate_campaigns(customer_id=customer_id, operations=[operation])
+
+    return {
+        "campaign_id": campaign_id,
+        "changed": paths,
+        "status_unchanged": current[0]["campaign"]["status"],
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign.id, campaign.name, campaign.status,
+                   campaign.start_date_time, campaign.end_date_time,
+                   campaign.network_settings.target_search_network,
+                   campaign.network_settings.target_content_network,
+                   campaign_budget.amount_micros
+            FROM campaign WHERE campaign.id = {campaign_id}
+            """,
+        ),
+    }
+
+
+@campaigns_mcp.tool
+def update_bid_strategy(
+    customer_id: str,
+    campaign_id: str,
+    bidding_strategy: str,
+    target_cpa: Optional[float] = None,
+    target_roas: Optional[float] = None,
+    confirm_spend: bool = False,
+) -> Dict[str, Any]:
+    """Changes a campaign's bidding strategy.
+
+    On a PAUSED campaign this is free: it still cannot spend. On an ENABLED
+    campaign it changes how money is spent right now, so it requires
+    confirm_spend=True.
+
+    Conversion-based strategies (MAXIMIZE_CONVERSIONS, TARGET_CPA,
+    TARGET_ROAS) need working conversion tracking in the account. Without it
+    the API rejects the change with CONVERSION_TRACKING_NOT_ENABLED.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        bidding_strategy: MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS,
+            TARGET_CPA or TARGET_ROAS.
+        target_cpa: Required for TARGET_CPA, in the account's own currency.
+        target_roas: Required for TARGET_ROAS, as a ratio (4.0 means 400%).
+        confirm_spend: Required when the campaign is ENABLED.
+
+    Returns:
+        Old and new strategy, and the campaign read back.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+    strategy = bidding_strategy.upper()
+
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign.bidding_strategy_type,
+               campaign_budget.amount_micros
+        FROM campaign WHERE campaign.id = {campaign_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No campaign {campaign_id} in account {customer_id}.")
+
+    old_strategy = current[0]["campaign"]["bidding_strategy_type"]
+    daily = _from_micros(int(current[0]["campaign_budget"]["amount_micros"]))
+
+    if _campaign_is_serving(current[0]) and not confirm_spend:
+        raise SpendConfirmationRequired(
+            f"'{current[0]['campaign']['name']}' is ENABLED and spending "
+            f"{daily}/day, about {round(daily * 30.4, 2)}/month in the "
+            f"account's currency. Changing its bidding from {old_strategy} to "
+            f"{strategy} changes how that money is spent immediately. Show "
+            f"this to the user and call again with confirm_spend=True only "
+            f"after they agree."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignService")
+    operation = client.get_type("CampaignOperation")
+    campaign = operation.update
+    campaign.resource_name = service.campaign_path(customer_id, campaign_id)
+
+    # The update mask has to name a LEAF field: masking the strategy message
+    # itself is rejected with FIELD_HAS_SUBFIELDS. For the strategies that
+    # carry no settings, mask a leaf we deliberately leave unset, which both
+    # selects the strategy and clears any stale value on it.
+    if strategy == "MANUAL_CPC":
+        campaign.manual_cpc.enhanced_cpc_enabled = False
+        path = "manual_cpc.enhanced_cpc_enabled"
+    elif strategy == "MAXIMIZE_CLICKS":
+        client.copy_from(
+            campaign.target_spend, client.get_type("TargetSpend")
+        )
+        path = "target_spend.cpc_bid_ceiling_micros"
+    elif strategy == "MAXIMIZE_CONVERSIONS":
+        client.copy_from(
+            campaign.maximize_conversions,
+            client.get_type("MaximizeConversions"),
+        )
+        path = "maximize_conversions.target_cpa_micros"
+    elif strategy == "TARGET_CPA":
+        if target_cpa is None:
+            raise ValueError("TARGET_CPA requires target_cpa.")
+        campaign.target_cpa.target_cpa_micros = _to_micros(target_cpa)
+        path = "target_cpa.target_cpa_micros"
+    elif strategy == "TARGET_ROAS":
+        if target_roas is None:
+            raise ValueError("TARGET_ROAS requires target_roas.")
+        campaign.target_roas.target_roas = target_roas
+        path = "target_roas.target_roas"
+    else:
+        raise ValueError(f"Unknown bidding strategy: {bidding_strategy}")
+
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=[path])
+    )
+    service.mutate_campaigns(customer_id=customer_id, operations=[operation])
+
+    return {
+        "campaign_id": campaign_id,
+        "old_bid_strategy": old_strategy,
+        "new_bid_strategy": strategy,
+        "campaign_status": current[0]["campaign"]["status"],
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign.id, campaign.name, campaign.status,
+                   campaign.bidding_strategy_type
+            FROM campaign WHERE campaign.id = {campaign_id}
+            """,
+        ),
+    }
+
+
+@campaigns_mcp.tool
+def set_device_bid_modifiers(
+    customer_id: str,
+    campaign_id: str,
+    modifiers: Dict[str, float],
+    confirm_spend: bool = False,
+) -> Dict[str, Any]:
+    """Sets per-device bid adjustments on a campaign.
+
+    A modifier multiplies the bid on that device: 1.0 is no change, 1.2 bids
+    20% more, 0.7 bids 30% less, 0 stops serving on that device entirely.
+    Raising any modifier above its current value can raise cost per click, so
+    it requires confirm_spend=True. Lowering is always allowed.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to adjust.
+        modifiers: Device name to multiplier, e.g.
+            {"MOBILE": 1.2, "DESKTOP": 0.8, "TABLET": 0}
+            Valid devices: MOBILE, DESKTOP, TABLET, CONNECTED_TV.
+        confirm_spend: Required when any modifier is being raised.
+
+    Returns:
+        The campaign's device modifiers, read back after the change.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+
+    valid = {"MOBILE", "DESKTOP", "TABLET", "CONNECTED_TV"}
+    cleaned = {}
+    for device, value in modifiers.items():
+        name = str(device).upper()
+        if name not in valid:
+            raise ValueError(f"Device must be one of {sorted(valid)}: {device}")
+        value = float(value)
+        if not 0 <= value <= 10:
+            raise ValueError(
+                f"Modifier for {name} must be between 0 and 10, got {value}."
+            )
+        cleaned[name] = value
+
+    existing = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign_criterion.criterion_id,
+               campaign_criterion.device.type,
+               campaign_criterion.bid_modifier
+        FROM campaign_criterion
+        WHERE campaign.id = {campaign_id}
+          AND campaign_criterion.type = DEVICE
+        """,
+    )
+    by_device = {}
+    for row in existing:
+        crit = row["campaign_criterion"]
+        by_device[str(crit["device"]["type_"])] = crit
+
+    raised = []
+    for name, value in cleaned.items():
+        old = by_device.get(name, {}).get("bid_modifier")
+        old_value = 1.0 if old is None else float(old)
+        if value > old_value:
+            raised.append(f"{name} {old_value} -> {value}")
+
+    if raised and not confirm_spend:
+        raise SpendConfirmationRequired(
+            "This raises bids on: "
+            + "; ".join(raised)
+            + ". Higher bids mean a higher cost per click, though the campaign "
+            "budget still caps the daily total. Show this to the user and call "
+            "again with confirm_spend=True only after they agree."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignCriterionService")
+    campaign_service = utils.get_googleads_service("CampaignService")
+
+    operations = []
+    for name, value in cleaned.items():
+        operation = client.get_type("CampaignCriterionOperation")
+        if name in by_device:
+            criterion = operation.update
+            criterion.resource_name = service.campaign_criterion_path(
+                customer_id, campaign_id, by_device[name]["criterion_id"]
+            )
+            criterion.bid_modifier = value
+            client.copy_from(
+                operation.update_mask,
+                field_mask_pb2.FieldMask(paths=["bid_modifier"]),
+            )
+        else:
+            criterion = operation.create
+            criterion.campaign = campaign_service.campaign_path(
+                customer_id, campaign_id
+            )
+            criterion.device.type_ = getattr(client.enums.DeviceEnum, name)
+            criterion.bid_modifier = value
+        operations.append(operation)
+
+    service.mutate_campaign_criteria(
+        customer_id=customer_id, operations=operations
+    )
+
+    return {
+        "campaign_id": campaign_id,
+        "applied": cleaned,
+        "raised": raised,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.device.type,
+                   campaign_criterion.bid_modifier
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type = DEVICE
             """,
         ),
     }

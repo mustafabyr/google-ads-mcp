@@ -26,9 +26,13 @@ before the call leaves the process.
 
 from typing import Any, Dict, List, Optional
 
+import proto
+
 from fastmcp import FastMCP
+from google.protobuf import field_mask_pb2
 
 import ads_mcp.utils as utils
+from ads_mcp.tools.campaigns import SpendConfirmationRequired
 
 adgroups_mcp = FastMCP("adgroups")
 
@@ -59,12 +63,21 @@ def _to_micros(amount: float) -> int:
     return int(round(amount * _MICROS))
 
 
+def _from_micros(micros: int) -> float:
+    return round((micros or 0) / _MICROS, 2)
+
+
 def _read_back(customer_id: str, query: str) -> List[Dict[str, Any]]:
     ga_service = utils.get_googleads_service("GoogleAdsService")
     rows = []
     for batch in ga_service.search_stream(customer_id=customer_id, query=query):
         for row in batch.results:
-            rows.append(utils.format_output_value(row))
+            # Enum NAMES, not the raw integers proto-plus defaults to: this
+            # output is read by a model, and "status": 3 tells it nothing.
+            # Status gates elsewhere in this module compare against the name.
+            rows.append(
+                proto.Message.to_dict(row, use_integers_for_enums=False)
+            )
     return rows
 
 
@@ -172,7 +185,7 @@ def set_ad_group_status(
     )
     operation.update.status = getattr(client.enums.AdGroupStatusEnum, status)
     client.copy_from(
-        operation.update_mask, client.get_type("FieldMask")(paths=["status"])
+        operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
     )
     service.mutate_ad_groups(customer_id=customer_id, operations=[operation])
 
@@ -531,3 +544,610 @@ def remove_keywords(
         customer_id=customer_id, operations=operations
     )
     return {"ad_group_id": ad_group_id, "removed": len(operations)}
+
+
+# --------------------------------------------------------------------------
+# Bids and status changes
+#
+# Raising a bid raises what the account can spend, so it goes through the same
+# confirm_spend gate as raising a budget. Lowering a bid, pausing anything, and
+# every read are always free.
+# --------------------------------------------------------------------------
+
+
+@adgroups_mcp.tool
+def update_ad_group_bid(
+    customer_id: str,
+    ad_group_id: str,
+    cpc_bid: float,
+    confirm_spend: bool = False,
+) -> Dict[str, Any]:
+    """Changes an ad group's max CPC bid.
+
+    RAISING a bid increases what the account can spend per click and requires
+    confirm_spend=True. Lowering it is allowed without confirmation.
+
+    Only manual bidding uses this value; automated strategies ignore it.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group to change.
+        cpc_bid: New max CPC in the account's own currency. Do not convert.
+        confirm_spend: Must be True when the new bid is higher than the
+            current one. Pass True only after the user has agreed.
+
+    Returns:
+        Old and new bid, read back from the API.
+    """
+    customer_id = _clean_id(customer_id)
+    ad_group_id = _clean_id(ad_group_id)
+
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT ad_group.id, ad_group.name, ad_group.cpc_bid_micros
+        FROM ad_group WHERE ad_group.id = {ad_group_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No ad group {ad_group_id} in account {customer_id}.")
+
+    old_micros = int(current[0]["ad_group"].get("cpc_bid_micros") or 0)
+    old_bid = _from_micros(old_micros)
+    new_micros = _to_micros(cpc_bid)
+
+    if new_micros > old_micros and not confirm_spend:
+        raise SpendConfirmationRequired(
+            f"This raises the max CPC for "
+            f"'{current[0]['ad_group']['name']}' from {old_bid} to {cpc_bid} "
+            f"in the account's currency, so every click can cost more. Show "
+            f"these numbers to the user and call again with confirm_spend=True "
+            f"only after they agree."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AdGroupService")
+    operation = client.get_type("AdGroupOperation")
+    operation.update.resource_name = service.ad_group_path(
+        customer_id, ad_group_id
+    )
+    operation.update.cpc_bid_micros = new_micros
+    client.copy_from(
+        operation.update_mask,
+        field_mask_pb2.FieldMask(paths=["cpc_bid_micros"]),
+    )
+    service.mutate_ad_groups(customer_id=customer_id, operations=[operation])
+
+    return {
+        "ad_group_id": ad_group_id,
+        "old_cpc_bid": old_bid,
+        "new_cpc_bid": cpc_bid,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT ad_group.id, ad_group.cpc_bid_micros
+            FROM ad_group WHERE ad_group.id = {ad_group_id}
+            """,
+        ),
+    }
+
+
+@adgroups_mcp.tool
+def set_keyword_status(
+    customer_id: str,
+    ad_group_id: str,
+    criterion_ids: List[str],
+    status: str,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Enables, pauses or removes keywords.
+
+    PAUSED is the safe way to stop a keyword: it stops serving but keeps its
+    history, so it can be turned back on. Prefer this over remove_keywords.
+    ENABLED needs no confirmation -- the campaign is still the spend gate.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the keywords belong to.
+        criterion_ids: Criterion ids, from add_keywords or a search query.
+        status: ENABLED, PAUSED or REMOVED.
+        confirm_remove: Required for REMOVED, which discards history.
+
+    Returns:
+        The keywords' state read back after the change.
+    """
+    customer_id = _clean_id(customer_id)
+    ad_group_id = _clean_id(ad_group_id)
+    status = status.upper()
+    if status not in {"ENABLED", "PAUSED", "REMOVED"}:
+        raise ValueError("status must be ENABLED, PAUSED or REMOVED.")
+    if status == "REMOVED" and not confirm_remove:
+        raise ValueError(
+            f"Removing {len(criterion_ids)} keyword(s) discards their history "
+            f"and is not reversible. Pausing keeps the history and can be "
+            f"undone. To remove anyway, call again with confirm_remove=True."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AdGroupCriterionService")
+
+    operations = []
+    for criterion_id in criterion_ids:
+        operation = client.get_type("AdGroupCriterionOperation")
+        operation.update.resource_name = service.ad_group_criterion_path(
+            customer_id, ad_group_id, _clean_id(criterion_id)
+        )
+        operation.update.status = getattr(
+            client.enums.AdGroupCriterionStatusEnum, status
+        )
+        client.copy_from(
+            operation.update_mask,
+            field_mask_pb2.FieldMask(paths=["status"]),
+        )
+        operations.append(operation)
+
+    service.mutate_ad_group_criteria(
+        customer_id=customer_id, operations=operations
+    )
+
+    ids = ",".join(_clean_id(c) for c in criterion_ids)
+    return {
+        "ad_group_id": ad_group_id,
+        "new_status": status,
+        "changed": len(operations),
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT ad_group_criterion.criterion_id,
+                   ad_group_criterion.keyword.text,
+                   ad_group_criterion.keyword.match_type,
+                   ad_group_criterion.status
+            FROM ad_group_criterion
+            WHERE ad_group_criterion.criterion_id IN ({ids})
+              AND ad_group.id = {ad_group_id}
+            """,
+        ),
+    }
+
+
+@adgroups_mcp.tool
+def update_keyword(
+    customer_id: str,
+    ad_group_id: str,
+    criterion_id: str,
+    cpc_bid: Optional[float] = None,
+    match_type: Optional[str] = None,
+    confirm_spend: bool = False,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Changes a keyword's bid, its match type, or both.
+
+    The two changes are not alike:
+
+      * A BID change is an in-place update. Raising it needs confirm_spend.
+      * A MATCH TYPE change is not possible in place -- Google treats the
+        keyword text and match type as the criterion's identity. Changing it
+        means removing the keyword and adding it back, which DISCARDS ITS
+        HISTORY and gives it a new criterion id, so it needs confirm_remove.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the keyword belongs to.
+        criterion_id: The keyword to change.
+        cpc_bid: New max CPC in the account's own currency. Omit to keep.
+        match_type: EXACT, PHRASE or BROAD. Omit to keep.
+        confirm_spend: Required when raising the bid.
+        confirm_remove: Required when changing the match type, because the
+            keyword's history is lost.
+
+    Returns:
+        What changed, and the keyword read back. When the match type changed,
+        `new_criterion_id` differs from the one passed in.
+    """
+    customer_id = _clean_id(customer_id)
+    ad_group_id = _clean_id(ad_group_id)
+    criterion_id = _clean_id(criterion_id)
+
+    if cpc_bid is None and match_type is None:
+        raise ValueError("Give cpc_bid, match_type, or both.")
+    if match_type is not None:
+        match_type = match_type.upper()
+        if match_type not in _MATCH_TYPES:
+            raise ValueError(
+                f"match_type must be one of {sorted(_MATCH_TYPES)}"
+            )
+
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT ad_group_criterion.criterion_id,
+               ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type,
+               ad_group_criterion.status,
+               ad_group_criterion.cpc_bid_micros
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.criterion_id = {criterion_id}
+          AND ad_group.id = {ad_group_id}
+        """,
+    )
+    if not current:
+        raise ValueError(
+            f"No keyword {criterion_id} in ad group {ad_group_id}."
+        )
+
+    row = current[0]["ad_group_criterion"]
+    text = row["keyword"]["text"]
+    old_match = row["keyword"]["match_type"]
+    old_micros = int(row.get("cpc_bid_micros") or 0)
+    old_bid = _from_micros(old_micros)
+
+    if cpc_bid is not None:
+        new_micros = _to_micros(cpc_bid)
+        if new_micros > old_micros and not confirm_spend:
+            raise SpendConfirmationRequired(
+                f"This raises the max CPC for '{text}' from {old_bid} to "
+                f"{cpc_bid} in the account's currency, so every click can "
+                f"cost more. Show these numbers to the user and call again "
+                f"with confirm_spend=True only after they agree."
+            )
+
+    changing_match = match_type is not None and match_type != old_match
+    if changing_match and not confirm_remove:
+        raise ValueError(
+            f"Google cannot change a keyword's match type in place. Moving "
+            f"'{text}' from {old_match} to {match_type} means removing it and "
+            f"adding it back: its performance history and criterion id are "
+            f"lost. To proceed, call again with confirm_remove=True."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AdGroupCriterionService")
+    ad_group_service = utils.get_googleads_service("AdGroupService")
+    ad_group_path = ad_group_service.ad_group_path(customer_id, ad_group_id)
+
+    if not changing_match:
+        # Bid-only change: a plain in-place update.
+        operation = client.get_type("AdGroupCriterionOperation")
+        operation.update.resource_name = service.ad_group_criterion_path(
+            customer_id, ad_group_id, criterion_id
+        )
+        operation.update.cpc_bid_micros = _to_micros(cpc_bid)
+        client.copy_from(
+            operation.update_mask,
+            field_mask_pb2.FieldMask(paths=["cpc_bid_micros"]),
+        )
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id, operations=[operation]
+        )
+        new_criterion_id = criterion_id
+    else:
+        # Match type change: remove, then re-create with the new match type.
+        remove_op = client.get_type("AdGroupCriterionOperation")
+        remove_op.remove = service.ad_group_criterion_path(
+            customer_id, ad_group_id, criterion_id
+        )
+
+        create_op = client.get_type("AdGroupCriterionOperation")
+        criterion = create_op.create
+        criterion.ad_group = ad_group_path
+        criterion.keyword.text = text
+        criterion.keyword.match_type = getattr(
+            client.enums.KeywordMatchTypeEnum, match_type
+        )
+        criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+        bid_micros = _to_micros(cpc_bid) if cpc_bid is not None else old_micros
+        if bid_micros:
+            criterion.cpc_bid_micros = bid_micros
+
+        response = service.mutate_ad_group_criteria(
+            customer_id=customer_id, operations=[remove_op, create_op]
+        )
+        new_criterion_id = response.results[-1].resource_name.rsplit("~", 1)[-1]
+
+    return {
+        "ad_group_id": ad_group_id,
+        "keyword": text,
+        "old_criterion_id": criterion_id,
+        "new_criterion_id": new_criterion_id,
+        "old_match_type": old_match,
+        "new_match_type": match_type or old_match,
+        "old_cpc_bid": old_bid,
+        "new_cpc_bid": cpc_bid if cpc_bid is not None else old_bid,
+        "history_discarded": changing_match,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT ad_group_criterion.criterion_id,
+                   ad_group_criterion.keyword.text,
+                   ad_group_criterion.keyword.match_type,
+                   ad_group_criterion.status,
+                   ad_group_criterion.cpc_bid_micros
+            FROM ad_group_criterion
+            WHERE ad_group_criterion.criterion_id = {new_criterion_id}
+              AND ad_group.id = {ad_group_id}
+            """,
+        ),
+    }
+
+
+@adgroups_mcp.tool
+def remove_negative_keywords(
+    customer_id: str,
+    criterion_ids: List[str],
+    campaign_id: Optional[str] = None,
+    ad_group_id: Optional[str] = None,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Removes negative keywords, at campaign or ad group level.
+
+    Note which way this cuts: a negative keyword BLOCKS traffic, so removing
+    one lets that traffic back in and the account starts paying for it again.
+    The campaign budget still caps the daily total, but what the money is
+    spent on changes. Say which terms will start matching again before
+    confirming.
+
+    Args:
+        customer_id: The Google Ads account id.
+        criterion_ids: Criterion ids of the negatives to remove.
+        campaign_id: Remove from campaign level. Give this OR ad_group_id.
+        ad_group_id: Remove from ad group level. Give this OR campaign_id.
+        confirm_remove: Must be True. Name the terms that will start matching
+            again first.
+
+    Returns:
+        How many were removed, and from where.
+    """
+    customer_id = _clean_id(customer_id)
+    if bool(campaign_id) == bool(ad_group_id):
+        raise ValueError("Give exactly one of campaign_id or ad_group_id.")
+    if not confirm_remove:
+        level = "campaign" if campaign_id else "ad group"
+        raise ValueError(
+            f"Removing {len(criterion_ids)} negative keyword(s) from the "
+            f"{level} lets the blocked searches match again, so the account "
+            f"will start paying for that traffic. List the terms for the user, "
+            f"then call again with confirm_remove=True."
+        )
+
+    client = utils.get_googleads_client()
+    operations = []
+
+    if campaign_id:
+        campaign_id = _clean_id(campaign_id)
+        service = utils.get_googleads_service("CampaignCriterionService")
+        for criterion_id in criterion_ids:
+            operation = client.get_type("CampaignCriterionOperation")
+            operation.remove = service.campaign_criterion_path(
+                customer_id, campaign_id, _clean_id(criterion_id)
+            )
+            operations.append(operation)
+        service.mutate_campaign_criteria(
+            customer_id=customer_id, operations=operations
+        )
+        verified = _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.keyword.text,
+                   campaign_criterion.negative
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type = KEYWORD
+              AND campaign_criterion.negative = true
+            """,
+        )
+        level, parent = "campaign", campaign_id
+    else:
+        ad_group_id = _clean_id(ad_group_id)
+        service = utils.get_googleads_service("AdGroupCriterionService")
+        for criterion_id in criterion_ids:
+            operation = client.get_type("AdGroupCriterionOperation")
+            operation.remove = service.ad_group_criterion_path(
+                customer_id, ad_group_id, _clean_id(criterion_id)
+            )
+            operations.append(operation)
+        service.mutate_ad_group_criteria(
+            customer_id=customer_id, operations=operations
+        )
+        verified = _read_back(
+            customer_id,
+            f"""
+            SELECT ad_group_criterion.criterion_id,
+                   ad_group_criterion.keyword.text,
+                   ad_group_criterion.negative
+            FROM ad_group_criterion
+            WHERE ad_group.id = {ad_group_id}
+              AND ad_group_criterion.negative = true
+            """,
+        )
+        level, parent = "ad_group", ad_group_id
+
+    return {
+        "level": level,
+        "parent_id": parent,
+        "removed": len(operations),
+        "note": (
+            "These searches can match again. The campaign budget still caps "
+            "the daily total."
+        ),
+        "remaining_negatives": verified,
+    }
+
+
+# --------------------------------------------------------------------------
+# Ad lifecycle
+# --------------------------------------------------------------------------
+
+
+@adgroups_mcp.tool
+def set_ad_status(
+    customer_id: str,
+    ad_group_id: str,
+    ad_id: str,
+    status: str,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Enables, pauses or removes a single ad.
+
+    Pausing a weak ad while leaving its siblings running is the normal way to
+    test creative. Enabling needs no confirmation -- the campaign is still the
+    spend gate.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the ad belongs to.
+        ad_id: The ad to change.
+        status: ENABLED, PAUSED or REMOVED.
+        confirm_remove: Required for REMOVED, which is not reversible.
+
+    Returns:
+        The ad's state read back after the change.
+    """
+    customer_id = _clean_id(customer_id)
+    ad_group_id = _clean_id(ad_group_id)
+    ad_id = _clean_id(ad_id)
+    status = status.upper()
+    if status not in {"ENABLED", "PAUSED", "REMOVED"}:
+        raise ValueError("status must be ENABLED, PAUSED or REMOVED.")
+    if status == "REMOVED" and not confirm_remove:
+        raise ValueError(
+            "Removing an ad discards its history and is not reversible. "
+            "Pausing stops it serving and can be undone. To remove anyway, "
+            "call again with confirm_remove=True."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AdGroupAdService")
+    operation = client.get_type("AdGroupAdOperation")
+    operation.update.resource_name = service.ad_group_ad_path(
+        customer_id, ad_group_id, ad_id
+    )
+    operation.update.status = getattr(
+        client.enums.AdGroupAdStatusEnum, status
+    )
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
+    )
+    service.mutate_ad_group_ads(customer_id=customer_id, operations=[operation])
+
+    return {
+        "ad_group_id": ad_group_id,
+        "ad_id": ad_id,
+        "new_status": status,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT ad_group_ad.ad.id, ad_group_ad.status,
+                   ad_group_ad.policy_summary.approval_status
+            FROM ad_group_ad WHERE ad_group_ad.ad.id = {ad_id}
+            """,
+        ),
+    }
+
+
+@adgroups_mcp.tool
+def update_ad_text(
+    customer_id: str,
+    ad_id: str,
+    headlines: Optional[List[str]] = None,
+    descriptions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Replaces the headlines and/or descriptions of a responsive search ad.
+
+    Whichever list you pass REPLACES that list entirely -- pass every headline
+    you want the ad to keep, not just the new ones. The character limits are
+    checked here first, so a too-long line fails with its own text and length
+    instead of an opaque API error.
+
+    Editing an ad sends it back to Google for review and resets its
+    performance history, so prefer it for fixing copy; to test a new angle,
+    create a second ad and pause the first.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_id: The ad to edit.
+        headlines: 3-15 headlines, each at most 30 characters. Omit to keep
+            the current ones.
+        descriptions: 2-4 descriptions, each at most 90 characters. Omit to
+            keep the current ones.
+
+    Returns:
+        What was replaced, and the ad read back.
+    """
+    customer_id = _clean_id(customer_id)
+    ad_id = _clean_id(ad_id)
+
+    if headlines is None and descriptions is None:
+        raise ValueError("Give headlines, descriptions, or both.")
+
+    if headlines is not None:
+        if not _MIN_HEADLINES <= len(headlines) <= _MAX_HEADLINES:
+            raise ValueError(
+                f"Need {_MIN_HEADLINES}-{_MAX_HEADLINES} headlines, got "
+                f"{len(headlines)}."
+            )
+        for text in headlines:
+            if len(text) > _MAX_HEADLINE_CHARS:
+                raise ValueError(
+                    f"Headline is {len(text)} characters, limit is "
+                    f"{_MAX_HEADLINE_CHARS}: {text!r}"
+                )
+    if descriptions is not None:
+        if not _MIN_DESCRIPTIONS <= len(descriptions) <= _MAX_DESCRIPTIONS:
+            raise ValueError(
+                f"Need {_MIN_DESCRIPTIONS}-{_MAX_DESCRIPTIONS} descriptions, "
+                f"got {len(descriptions)}."
+            )
+        for text in descriptions:
+            if len(text) > _MAX_DESCRIPTION_CHARS:
+                raise ValueError(
+                    f"Description is {len(text)} characters, limit is "
+                    f"{_MAX_DESCRIPTION_CHARS}: {text!r}"
+                )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AdService")
+
+    operation = client.get_type("AdOperation")
+    ad = operation.update
+    ad.resource_name = service.ad_path(customer_id, ad_id)
+
+    paths = []
+    if headlines is not None:
+        for text in headlines:
+            asset = client.get_type("AdTextAsset")
+            asset.text = text
+            ad.responsive_search_ad.headlines.append(asset)
+        paths.append("responsive_search_ad.headlines")
+    if descriptions is not None:
+        for text in descriptions:
+            asset = client.get_type("AdTextAsset")
+            asset.text = text
+            ad.responsive_search_ad.descriptions.append(asset)
+        paths.append("responsive_search_ad.descriptions")
+
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
+    )
+    service.mutate_ads(customer_id=customer_id, operations=[operation])
+
+    return {
+        "ad_id": ad_id,
+        "headlines_replaced": len(headlines) if headlines else 0,
+        "descriptions_replaced": len(descriptions) if descriptions else 0,
+        "note": (
+            "The edited ad goes back to Google for review. The parent campaign "
+            "is still the spend gate."
+        ),
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT ad_group_ad.ad.id,
+                   ad_group_ad.ad.responsive_search_ad.headlines,
+                   ad_group_ad.ad.responsive_search_ad.descriptions,
+                   ad_group_ad.status,
+                   ad_group_ad.policy_summary.approval_status
+            FROM ad_group_ad WHERE ad_group_ad.ad.id = {ad_id}
+            """,
+        ),
+    }
