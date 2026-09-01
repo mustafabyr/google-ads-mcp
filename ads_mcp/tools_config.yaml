@@ -10,3 +10,4 @@ namespaces:
   campaigns: true
   adgroups: true
   conversions: true
+  extensions: true

@@ -55,6 +55,7 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 | Module | Namespace | Contents |
 |---|---|---|
 | `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting, ad schedule, location lookup |
+| `extensions.py` | `extensions` | sitelinks, callouts, structured snippets |
 | `conversions.py` | `conversions` | conversion actions, tag snippets, campaign conversion goals |
 | `adgroups.py` | `adgroups` | ad groups, responsive search ads and their text, ad status, keywords and their bids/match types/status, negative keywords |
 | `core.py`, `search.py`, `get_resource_metadata.py` | — | Google's originals, unmodified |
@@ -123,6 +124,8 @@ These cost a debugging session each. Check them in every new tool.
   which loses history and issues a new criterion id.
 - `include_in_conversions_metric` cannot be set when creating a conversion
   action; Google derives it from the category.
+- A GAQL query must SELECT any field it filters on. `FROM campaign_asset
+  WHERE campaign.id = X` fails unless `campaign.id` is also selected.
 - Target CPA and Target ROAS are no longer strategies of their own. Target CPA
   is `maximize_conversions.target_cpa_micros`; Target ROAS is
   `maximize_conversion_value.target_roas`. The standalone `target_cpa` /
@@ -131,7 +134,9 @@ These cost a debugging session each. Check them in every new tool.
 
 ## Still to build
 
-- Ad extensions / assets (phase 3): sitelinks, callouts, structured snippets
+- Reporting shortcuts (phase 4): thin GAQL wrappers, no server-side AI
+- Keyword research (phase 5): `KeywordPlanIdeaService`
+- Performance Max and other campaign types (phase 6)
 - Deploy to Cloud Run (`min_instances=0`), add as a custom connector in Claude
 - Upstream has a merged PR documenting `login-customer-id` on Cloud Run —
   read it before deploying
