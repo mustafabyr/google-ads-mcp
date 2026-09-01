@@ -14,3 +14,4 @@ namespaces:
   reports: true
   keyword_research: true
   pmax: true
+  campaign_types: true

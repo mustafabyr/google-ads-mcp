@@ -55,6 +55,7 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 | Module | Namespace | Contents |
 |---|---|---|
 | `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting, ad schedule, location lookup |
+| `campaign_types.py` | `campaign_types` | Demand Gen and YouTube campaigns, YouTube video assets |
 | `pmax.py` | `pmax` | Performance Max campaigns, asset groups, image assets, signals |
 | `keyword_research.py` | `keyword_research` | search volume, competition, top-of-page bid ranges |
 | `reports.py` | `reports` | campaign list, performance, structure, search terms, wasted spend |
@@ -139,6 +140,12 @@ These cost a debugging session each. Check them in every new tool.
   validating the asset group that references it; it reports
   `NOT_ENOUGH_HEADLINE_ASSET` instead, which points at the wrong problem.
 - `url_expansion_opt_out` no longer exists on Campaign in v25.
+- Demand Gen looks like Performance Max but does NOT use asset groups —
+  `CANNOT_ADD_ASSET_GROUP_FOR_CAMPAIGN_TYPE`. It keeps ad groups, with the
+  creative in one `demand_gen_multi_asset_ad`.
+- VIDEO campaigns reject `MAXIMIZE_CONVERSIONS` (use `target_cpm` /
+  `target_cpa`) and, on the test account, reject creation outright with
+  `MUTATE_NOT_ALLOWED`.
 - Target CPA and Target ROAS are no longer strategies of their own. Target CPA
   is `maximize_conversions.target_cpa_micros`; Target ROAS is
   `maximize_conversion_value.target_roas`. The standalone `target_cpa` /
@@ -147,7 +154,11 @@ These cost a debugging session each. Check them in every new tool.
 
 ## Still to build
 
-- Demand Gen and YouTube campaign types
+- Confirm on a PRODUCTION account whether `create_youtube_campaign` works.
+  Google returns `MUTATE_NOT_ALLOWED` for VIDEO campaign creation on the test
+  account, which could be a test-account restriction or the API closing video
+  creation as Video Action moves into Demand Gen. Everything except the
+  campaign create is exercised.
 - Audience creation — `add_pmax_audience_signal` consumes audiences but
   nothing here makes them, and the test account has none, so that one path is
   verified only as far as the API error.
