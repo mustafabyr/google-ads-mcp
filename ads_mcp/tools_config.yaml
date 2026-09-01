@@ -8,3 +8,4 @@ namespaces:
   search: true
   metadata: true
   campaigns: true
+  adgroups: true
