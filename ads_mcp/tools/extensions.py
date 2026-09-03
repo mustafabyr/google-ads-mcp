@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Write tools for ad extensions (assets): sitelinks, callouts, snippets.
+"""Write tools for ad extensions (assets): sitelinks, callouts, snippets, call.
 
 Extensions never raise what an account can spend -- the campaign budget still
 caps the day -- so nothing here needs confirm_spend. They do change what the
@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 import proto
 from fastmcp import FastMCP
+from google.protobuf import field_mask_pb2
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
@@ -112,6 +113,7 @@ def _campaign_extensions(customer_id: str, campaign_id: str) -> List[Dict]:
         customer_id,
         f"""
         SELECT campaign.id,
+               campaign_asset.resource_name,
                campaign_asset.field_type, campaign_asset.status,
                asset.id, asset.name,
                asset.sitelink_asset.link_text,
@@ -120,11 +122,14 @@ def _campaign_extensions(customer_id: str, campaign_id: str) -> List[Dict]:
                asset.callout_asset.callout_text,
                asset.structured_snippet_asset.header,
                asset.structured_snippet_asset.values,
+               asset.call_asset.phone_number,
+               asset.call_asset.country_code,
+               asset.call_asset.call_conversion_reporting_state,
                asset.final_urls
         FROM campaign_asset
         WHERE campaign.id = {campaign_id}
           AND campaign_asset.field_type IN
-              ('SITELINK', 'CALLOUT', 'STRUCTURED_SNIPPET')
+              ('SITELINK', 'CALLOUT', 'STRUCTURED_SNIPPET', 'CALL')
           AND campaign_asset.status != 'REMOVED'
         """,
     )
@@ -419,4 +424,335 @@ def remove_campaign_extension(
         "field_type": field_type,
         "note": "The asset stays in the account and can be linked again.",
         "verified": _campaign_extensions(customer_id, campaign_id),
+    }
+
+
+@extensions_mcp.tool
+def add_call_extension(
+    customer_id: str,
+    campaign_id: str,
+    phone_number: str,
+    country_code: str = "TR",
+    call_conversion_action_id: Optional[str] = None,
+    disable_call_conversion: bool = False,
+    replace_existing: bool = False,
+) -> Dict[str, Any]:
+    """Adds a call extension, and with it the only biddable measure of calls.
+
+    For a local business this is usually the highest-value extension there
+    is: it puts a call button on the ad, and -- unlike the "click to call"
+    action that comes from the Business Profile -- the calls it produces
+    become a NORMAL conversion action that smart bidding can actually bid
+    toward. Google-hosted local actions cannot; they are immutable and the
+    API refuses to make them biddable.
+
+    Measurement rides on a Google forwarding number, which Google swaps in
+    for the real one so it can time the call. That needs call reporting
+    switched on at account level -- this tool reads that setting back and
+    says so when it is off, because with it off the extension still shows
+    but nothing is measured.
+
+    Extensions cannot raise spend beyond the campaign budget, so this needs
+    no confirmation.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to add the call button to.
+        phone_number: The business number as a local caller would dial it,
+            e.g. "0530 407 49 50". Spaces and dashes are stripped.
+        country_code: Two-letter country of the number, e.g. "TR".
+        call_conversion_action_id: Count calls against THIS conversion action
+            instead of the account default. Omit to use the account default,
+            which is what most accounts want.
+        disable_call_conversion: True to show the button but measure nothing.
+            Only for an account that already tracks calls another way.
+        replace_existing: A campaign with a call extension already gets the
+            existing one back untouched, since a second one is duplication,
+            not safety. True removes the old link first.
+
+    Returns:
+        The asset created, the account's call reporting state, and the
+        campaign's extensions read back.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+
+    country_code = str(country_code).strip().upper()
+    if len(country_code) != 2 or not country_code.isalpha():
+        raise ValueError(
+            f"country_code must be two letters, e.g. 'TR': {country_code!r}"
+        )
+
+    digits = "".join(ch for ch in str(phone_number) if ch.isdigit())
+    if not 7 <= len(digits) <= 15:
+        raise ValueError(
+            f"phone_number has {len(digits)} digits, expected 7-15: "
+            f"{phone_number!r}"
+        )
+    if call_conversion_action_id and disable_call_conversion:
+        raise ValueError(
+            "call_conversion_action_id and disable_call_conversion "
+            "contradict each other: pick one."
+        )
+
+    existing = [
+        row
+        for row in _campaign_extensions(customer_id, campaign_id)
+        if row["campaign_asset"]["field_type"] == "CALL"
+    ]
+    if existing and not replace_existing:
+        return {
+            "campaign_id": campaign_id,
+            "created": False,
+            "note": (
+                "This campaign already has a call extension. A second one "
+                "duplicates the same slot rather than adding anything. Call "
+                "again with replace_existing=True to swap the number."
+            ),
+            "existing": existing,
+        }
+
+    client = utils.get_googleads_client()
+    asset_service = utils.get_googleads_service("AssetService")
+
+    operation = client.get_type("AssetOperation")
+    asset = operation.create
+    asset.name = f"Call: +{country_code} {digits}"
+    asset.call_asset.country_code = country_code
+    asset.call_asset.phone_number = digits
+
+    states = client.enums.CallConversionReportingStateEnum
+    if disable_call_conversion:
+        asset.call_asset.call_conversion_reporting_state = states.DISABLED
+    elif call_conversion_action_id:
+        conversion_service = utils.get_googleads_service(
+            "ConversionActionService"
+        )
+        asset.call_asset.call_conversion_action = (
+            conversion_service.conversion_action_path(
+                customer_id, _clean_id(call_conversion_action_id)
+            )
+        )
+        asset.call_asset.call_conversion_reporting_state = (
+            states.USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION
+        )
+    else:
+        asset.call_asset.call_conversion_reporting_state = (
+            states.USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION
+        )
+
+    response = asset_service.mutate_assets(
+        customer_id=customer_id, operations=[operation]
+    )
+    asset_resource_name = response.results[0].resource_name
+
+    if existing and replace_existing:
+        campaign_asset_service = utils.get_googleads_service(
+            "CampaignAssetService"
+        )
+        removals = []
+        for row in existing:
+            removal = client.get_type("CampaignAssetOperation")
+            removal.remove = row["campaign_asset"]["resource_name"]
+            removals.append(removal)
+        if removals:
+            campaign_asset_service.mutate_campaign_assets(
+                customer_id=customer_id, operations=removals
+            )
+
+    _link_assets_to_campaign(
+        customer_id, campaign_id, [asset_resource_name], "CALL"
+    )
+
+    # With call reporting off the button still shows, but no call is timed
+    # and nothing lands in any conversion action -- the whole reason for
+    # adding this. Say so plainly rather than reporting a clean success.
+    reporting = _read_back(
+        customer_id,
+        """
+        SELECT customer.id,
+               customer.call_reporting_setting.call_reporting_enabled,
+               customer.call_reporting_setting.call_conversion_reporting_enabled
+        FROM customer
+        """,
+    )
+    setting = (
+        reporting[0]["customer"].get("call_reporting_setting", {})
+        if reporting
+        else {}
+    )
+    warnings = []
+    if not setting.get("call_reporting_enabled"):
+        warnings.append(
+            "Account-level call reporting is OFF: the call button will show "
+            "but no Google forwarding number is used, so no call is measured."
+        )
+    if not disable_call_conversion and not setting.get(
+        "call_conversion_reporting_enabled"
+    ):
+        warnings.append(
+            "Account-level call CONVERSION reporting is OFF: calls will not "
+            "become conversions, so smart bidding still has nothing to bid "
+            "toward."
+        )
+
+    return {
+        "campaign_id": campaign_id,
+        "created": True,
+        "asset_resource_name": asset_resource_name,
+        "phone_number": digits,
+        "country_code": country_code,
+        "call_reporting_setting": setting,
+        "warnings": warnings,
+        "verified": _campaign_extensions(customer_id, campaign_id),
+    }
+
+
+@extensions_mcp.tool
+def update_call_extension(
+    customer_id: str,
+    asset_id: str,
+    call_conversion_action_id: Optional[str] = None,
+    use_account_default: bool = False,
+    disable_call_conversion: bool = False,
+) -> Dict[str, Any]:
+    """Repoints an existing call extension at a conversion action, in place.
+
+    The common broken state, and the reason this exists: an extension left on
+    USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION with no action actually set.
+    The button shows, people call, and the call lands nowhere. Removing and
+    re-creating the asset would fix it too, but that detaches the extension's
+    history -- so change the field instead.
+
+    Pass exactly one of use_account_default, call_conversion_action_id or
+    disable_call_conversion.
+
+    Args:
+        customer_id: The Google Ads account id.
+        asset_id: The call asset to fix, from list_campaign_extensions.
+        call_conversion_action_id: Count calls against THIS action.
+        use_account_default: Count calls against the account's own call
+            conversion action. This is the right answer for most accounts,
+            and the fix for the empty-resource-level state above.
+        disable_call_conversion: Show the button, measure nothing.
+
+    Returns:
+        The asset before and after, plus the account's call reporting state --
+        which has to be on for any of this to measure anything.
+    """
+    customer_id = _clean_id(customer_id)
+    asset_id = _clean_id(asset_id)
+
+    chosen = [
+        bool(use_account_default),
+        bool(call_conversion_action_id),
+        bool(disable_call_conversion),
+    ]
+    if sum(chosen) != 1:
+        raise ValueError(
+            "Pass exactly one of use_account_default, "
+            "call_conversion_action_id or disable_call_conversion."
+        )
+
+    before = _read_back(
+        customer_id,
+        f"""
+        SELECT asset.id, asset.name, asset.type,
+               asset.call_asset.phone_number,
+               asset.call_asset.country_code,
+               asset.call_asset.call_conversion_reporting_state,
+               asset.call_asset.call_conversion_action
+        FROM asset
+        WHERE asset.id = {asset_id}
+        """,
+    )
+    if not before:
+        raise ValueError(f"No asset {asset_id} in account {customer_id}.")
+    if before[0]["asset"].get("type_") != "CALL":
+        raise ValueError(
+            f"Asset {asset_id} is a {before[0]['asset'].get('type_')} asset, "
+            f"not a CALL asset."
+        )
+
+    client = utils.get_googleads_client()
+    asset_service = utils.get_googleads_service("AssetService")
+    states = client.enums.CallConversionReportingStateEnum
+
+    operation = client.get_type("AssetOperation")
+    asset = operation.update
+    asset.resource_name = asset_service.asset_path(customer_id, asset_id)
+
+    paths = ["call_asset.call_conversion_reporting_state"]
+    if disable_call_conversion:
+        asset.call_asset.call_conversion_reporting_state = states.DISABLED
+    elif use_account_default:
+        asset.call_asset.call_conversion_reporting_state = (
+            states.USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION
+        )
+    else:
+        conversion_service = utils.get_googleads_service(
+            "ConversionActionService"
+        )
+        asset.call_asset.call_conversion_action = (
+            conversion_service.conversion_action_path(
+                customer_id, _clean_id(call_conversion_action_id)
+            )
+        )
+        asset.call_asset.call_conversion_reporting_state = (
+            states.USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION
+        )
+        paths.append("call_asset.call_conversion_action")
+
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
+    )
+    asset_service.mutate_assets(
+        customer_id=customer_id, operations=[operation]
+    )
+
+    reporting = _read_back(
+        customer_id,
+        """
+        SELECT customer.id,
+               customer.call_reporting_setting.call_reporting_enabled,
+               customer.call_reporting_setting.call_conversion_reporting_enabled,
+               customer.call_reporting_setting.call_conversion_action
+        FROM customer
+        """,
+    )
+    setting = (
+        reporting[0]["customer"].get("call_reporting_setting", {})
+        if reporting
+        else {}
+    )
+    warnings = []
+    if not setting.get("call_reporting_enabled"):
+        warnings.append(
+            "Account-level call reporting is OFF: no Google forwarding "
+            "number is used, so no call is measured whatever this asset says."
+        )
+    if use_account_default and not setting.get("call_conversion_action"):
+        warnings.append(
+            "use_account_default was chosen but the account has no call "
+            "conversion action set, so there is still nothing to count into."
+        )
+
+    return {
+        "asset_id": asset_id,
+        "updated_fields": paths,
+        "before": before[0]["asset"],
+        "after": _read_back(
+            customer_id,
+            f"""
+            SELECT asset.id, asset.name,
+                   asset.call_asset.phone_number,
+                   asset.call_asset.country_code,
+                   asset.call_asset.call_conversion_reporting_state,
+                   asset.call_asset.call_conversion_action
+            FROM asset
+            WHERE asset.id = {asset_id}
+            """,
+        )[0]["asset"],
+        "call_reporting_setting": setting,
+        "warnings": warnings,
     }

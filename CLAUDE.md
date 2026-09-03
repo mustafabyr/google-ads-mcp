@@ -54,13 +54,13 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 
 | Module | Namespace | Contents |
 |---|---|---|
-| `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting, ad schedule, location lookup |
+| `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting (location ids + proximity radius), ad schedule, location lookup |
 | `campaign_types.py` | `campaign_types` | Demand Gen and YouTube campaigns, YouTube video assets |
 | `pmax.py` | `pmax` | Performance Max campaigns, asset groups, image assets, signals |
 | `keyword_research.py` | `keyword_research` | search volume, competition, top-of-page bid ranges |
 | `reports.py` | `reports` | campaign list, performance, structure, search terms, wasted spend |
-| `extensions.py` | `extensions` | sitelinks, callouts, structured snippets |
-| `conversions.py` | `conversions` | conversion actions, tag snippets, campaign conversion goals |
+| `extensions.py` | `extensions` | sitelinks, callouts, structured snippets, call extensions (add + repoint) |
+| `conversions.py` | `conversions` | conversion actions (create + update), tag snippets, campaign conversion goals |
 | `adgroups.py` | `adgroups` | ad groups, responsive search ads and their text, ad status, keywords and their bids/match types/status, negative keywords |
 | `core.py`, `search.py`, `get_resource_metadata.py` | — | Google's originals, unmodified |
 
@@ -124,8 +124,45 @@ These cost a debugging session each. Check them in every new tool.
 - `contains_eu_political_advertising` is required on every campaign create.
 - A keyword's match type is immutable. Changing it means remove + re-create,
   which loses history and issues a new criterion id.
-- `include_in_conversions_metric` cannot be set when creating a conversion
-  action; Google derives it from the category.
+- `include_in_conversions_metric` cannot be set when CREATING a conversion
+  action; Google derives it from the category. It can only be changed
+  afterwards, with `update_conversion_action`. An action that records fine
+  but sits outside that metric starves every conversion-based bidding
+  strategy in the account, so this is the first thing to check on an
+  inherited account.
+- A call extension can sit on `USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION`
+  with an EMPTY `call_conversion_action`: the button shows, people call, and
+  the call is counted nowhere. Check that pair on every inherited account and
+  repoint it with `update_call_extension` -- removing and re-creating the
+  asset fixes it too but detaches the extension's history.
+- A GOOGLE_HOSTED conversion action (Business Profile local actions: click
+  to call, directions, website visits) is owned by Google and cannot be
+  mutated at all -- `MUTATE_NOT_ALLOWED` on `type` plus `IMMUTABLE_FIELD` on
+  `include_in_conversions_metric`. The only way to make one bid-worthy is to
+  make its CATEGORY biddable on the campaign, via campaign conversion goals.
+- `CampaignConversionGoalService.mutate` takes no `partial_failure`: a batch
+  is all or nothing, so goals are sent one operation per call and refusals
+  are collected per goal.
+- `campaign_conversion_goal` rows are keyed by (category, ORIGIN), and an
+  account can expose rows whose origin is `UNKNOWN`. Those have no valid
+  resource name: building one emits the literal "UNKNOWN" and the API
+  rejects the entire batch with `BAD_RESOURCE_ID`. Skip them, and send goal
+  mutations with `partial_failure=True` so one Google-hosted goal the API
+  refuses does not discard the rest.
+- Geo targeting for a single-location business is a RADIUS, not a district:
+  districts are administrative and routinely reach 15km inland while the
+  street two minutes away sits in the next one. Use `set_campaign_proximity`,
+  and pass `replace_existing_locations=True` when switching, or the wider
+  district criterion stays and wins.
+- `campaign.geo_target_type_setting.positive_geo_target_type` defaults to
+  PRESENCE_OR_INTEREST, which serves ads to people merely INTERESTED in the
+  area from anywhere. For a local business it must be PRESENCE. This is the
+  commonest silent leak in an inherited local account.
+- A GAQL field path cannot wrap across lines. Splitting
+  `customer.call_reporting_setting.call_conversion_reporting_enabled` after
+  the second dot to fit 79 columns fails with `UNEXPECTED_INPUT: unexpected
+  input ..` -- and if the query sits AFTER a mutate, the write has already
+  landed while the tool reports failure. Keep long field paths on one line.
 - A GAQL query must SELECT any field it filters on. `FROM campaign_asset
   WHERE campaign.id = X` fails unless `campaign.id` is also selected.
 - Performance Max has to be built in ONE atomic `GoogleAdsService.mutate`

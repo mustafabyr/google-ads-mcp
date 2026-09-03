@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 import proto
 from fastmcp import FastMCP
+from google.ads.googleads.errors import GoogleAdsException
 from google.protobuf import field_mask_pb2
 from mcp.types import ToolAnnotations
 
@@ -51,6 +52,18 @@ _CATEGORIES = {
 }
 
 _COUNTING = {"ONE_PER_CLICK", "MANY_PER_CLICK"}
+
+# Goal rows the API exposes but will not let you address by resource name.
+_UNADDRESSABLE_ORIGINS = {"UNKNOWN", "UNSPECIFIED"}
+
+# Bidding strategies that spend against the "Conversions" column, so
+# changing what feeds that column changes live spend.
+_CONVERSION_BASED_STRATEGIES = (
+    "MAXIMIZE_CONVERSIONS",
+    "TARGET_CPA",
+    "MAXIMIZE_CONVERSION_VALUE",
+    "TARGET_ROAS",
+)
 
 
 def _clean_id(value: str) -> str:
@@ -339,12 +352,26 @@ def set_campaign_conversion_goals(
     campaign_path = campaign_service.campaign_path(customer_id, campaign_id)
 
     operations = []
-    changed = []
+    op_keys = []
+    intended = {}
+    skipped = []
     for row in goals:
         goal = row["campaign_conversion_goal"]
         category, origin = goal["category"], goal["origin"]
         should_bid = category in wanted
         if bool(goal.get("biddable")) == should_bid:
+            continue
+
+        # A goal row whose origin is UNKNOWN/UNSPECIFIED has no addressable
+        # resource name: campaign_conversion_goal_path emits the literal
+        # "UNKNOWN" and the API rejects the WHOLE batch with BAD_RESOURCE_ID.
+        # Accounts carried over from older conversion setups routinely expose
+        # these rows, so skip them and say so instead of failing everything.
+        if origin in _UNADDRESSABLE_ORIGINS:
+            skipped.append(
+                f"{category}/{origin}: this goal has no addressable resource "
+                f"name and cannot be changed through the API"
+            )
             continue
 
         operation = client.get_type("CampaignConversionGoalOperation")
@@ -360,26 +387,275 @@ def set_campaign_conversion_goals(
             field_mask_pb2.FieldMask(paths=["biddable"]),
         )
         operations.append(operation)
-        changed.append(f"{category}/{origin} -> biddable={should_bid}")
+        op_keys.append((category, origin))
+        intended[(category, origin)] = should_bid
 
-    if operations:
-        service.mutate_campaign_conversion_goals(
-            customer_id=customer_id, operations=operations
-        )
+    # CampaignConversionGoalService takes no partial_failure flag, so a batch
+    # is all or nothing: one goal the API refuses -- Google-hosted goals
+    # frequently are -- would discard every goal it would have accepted. Send
+    # them one at a time and keep going. What actually landed is decided by
+    # the read-back below, never by the request (see CLAUDE.md).
+    refused = {}
+    for key, operation in zip(op_keys, operations):
+        try:
+            service.mutate_campaign_conversion_goals(
+                customer_id=customer_id, operations=[operation]
+            )
+        except GoogleAdsException as exc:
+            refused[key] = "; ".join(
+                error.message for error in exc.failure.errors
+            ) or "refused by the API"
+
+    after = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign_conversion_goal.category,
+               campaign_conversion_goal.origin,
+               campaign_conversion_goal.biddable
+        FROM campaign_conversion_goal
+        WHERE campaign.id = {campaign_id}
+        """,
+    )
+    state = {
+        (
+            r["campaign_conversion_goal"]["category"],
+            r["campaign_conversion_goal"]["origin"],
+        ): bool(r["campaign_conversion_goal"].get("biddable"))
+        for r in after
+    }
+
+    applied, rejected = [], []
+    for key, should_bid in intended.items():
+        category, origin = key
+        line = f"{category}/{origin} -> biddable={should_bid}"
+        if state.get(key) == should_bid:
+            applied.append(line)
+        else:
+            reason = refused.get(key, "the API accepted the write but the "
+                                      "read-back still disagrees")
+            rejected.append(f"{line}: {reason}")
 
     return {
         "campaign_id": campaign_id,
         "biddable_categories": sorted(wanted),
-        "changed": changed,
-        "verified": _read_back(
+        "applied": applied,
+        "rejected_by_api": rejected,
+        "skipped": skipped,
+        "biddable_now": sorted(
+            f"{c}/{o}" for (c, o), biddable in state.items() if biddable
+        ),
+    }
+
+
+@conversions_mcp.tool
+def update_conversion_action(
+    customer_id: str,
+    conversion_action_id: str,
+    include_in_conversions_metric: Optional[bool] = None,
+    primary_for_goal: Optional[bool] = None,
+    default_value: Optional[float] = None,
+    always_use_default_value: Optional[bool] = None,
+    click_lookback_days: Optional[int] = None,
+    name: Optional[str] = None,
+    status: Optional[str] = None,
+    confirm_spend: bool = False,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Changes an existing conversion action, including whether it counts.
+
+    This fixes the commonest broken account: an action that records perfectly
+    but sits OUTSIDE the "Conversions" column, so every conversion-based
+    bidding strategy in the account is optimizing toward nothing while the
+    real signal accumulates unused. `include_in_conversions_metric` is that
+    switch, and it cannot be set at creation time -- only here.
+
+    Because that switch decides what smart bidding chases, changing it (or
+    `primary_for_goal`, or the value) while a conversion-based strategy is
+    serving requires confirm_spend=True. Renaming is always free, and
+    status=REMOVED is not reversible so it requires confirm_remove=True.
+
+    This does NOT work on GOOGLE_HOSTED actions -- the local actions that
+    come from the Business Profile, such as "click to call" and "directions".
+    Google owns those and refuses every mutate with MUTATE_NOT_ALLOWED and
+    IMMUTABLE_FIELD. To make one of them bid-worthy, make its CATEGORY
+    biddable on the campaign with set_campaign_conversion_goals instead.
+
+    Args:
+        customer_id: The Google Ads account id.
+        conversion_action_id: The action to change, from
+            list_conversion_actions.
+        include_in_conversions_metric: True to feed the "Conversions" column
+            that smart bidding optimizes; False to keep it for reporting only.
+        primary_for_goal: True to make this action primary for its goal
+            category, False for secondary.
+        default_value: Value of one conversion, in the ACCOUNT'S OWN currency.
+        always_use_default_value: True to ignore any value sent by the tag.
+        click_lookback_days: How many days after a click a conversion still
+            counts, 1-90.
+        name: New name for the action.
+        status: ENABLED, PAUSED or REMOVED.
+        confirm_spend: Required when a change would alter what a serving
+            conversion-based campaign bids toward.
+        confirm_remove: Required for status=REMOVED.
+
+    Returns:
+        The action's real post-write state, read back from the API.
+    """
+    customer_id = _clean_id(customer_id)
+    conversion_action_id = _clean_id(conversion_action_id)
+
+    changes_bidding = any(
+        value is not None
+        for value in (
+            include_in_conversions_metric,
+            primary_for_goal,
+            default_value,
+            always_use_default_value,
+        )
+    )
+    if (
+        not changes_bidding
+        and name is None
+        and status is None
+        and click_lookback_days is None
+    ):
+        raise ValueError("Nothing to change: pass at least one field.")
+
+    if click_lookback_days is not None and not 1 <= click_lookback_days <= 90:
+        raise ValueError("click_lookback_days must be between 1 and 90.")
+
+    if status is not None:
+        status = status.upper()
+        if status not in {"ENABLED", "PAUSED", "REMOVED"}:
+            raise ValueError("status must be ENABLED, PAUSED or REMOVED.")
+        if status == "REMOVED" and not confirm_remove:
+            raise ValueError(
+                "Removing a conversion action is not reversible: its history "
+                "stops being usable and any bidding strategy pointed at it "
+                "loses that signal. Say so, then call again with "
+                "confirm_remove=True."
+            )
+
+    before = _read_back(
+        customer_id,
+        f"""
+        SELECT conversion_action.id, conversion_action.name,
+               conversion_action.status, conversion_action.type,
+               conversion_action.category,
+               conversion_action.include_in_conversions_metric,
+               conversion_action.primary_for_goal,
+               conversion_action.click_through_lookback_window_days,
+               conversion_action.value_settings.default_value
+        FROM conversion_action
+        WHERE conversion_action.id = {conversion_action_id}
+        """,
+    )
+    if not before:
+        raise ValueError(
+            f"No conversion action {conversion_action_id} in account "
+            f"{customer_id}."
+        )
+
+    # Feeding, or starving, the "Conversions" column changes how a serving
+    # smart-bidding campaign spends from the next auction onward.
+    if changes_bidding and not confirm_spend:
+        strategies = "', '".join(_CONVERSION_BASED_STRATEGIES)
+        serving = _read_back(
             customer_id,
             f"""
-            SELECT campaign_conversion_goal.category,
-                   campaign_conversion_goal.origin,
-                   campaign_conversion_goal.biddable
-            FROM campaign_conversion_goal
-            WHERE campaign.id = {campaign_id}
-              AND campaign_conversion_goal.biddable = true
+            SELECT campaign.name, campaign.bidding_strategy_type,
+                   campaign_budget.amount_micros
+            FROM campaign
+            WHERE campaign.status = 'ENABLED'
+              AND campaign.bidding_strategy_type IN ('{strategies}')
             """,
+        )
+        if serving:
+            daily = sum(
+                _from_micros(int(row["campaign_budget"]["amount_micros"]))
+                for row in serving
+            )
+            names = ", ".join(
+                f"{row['campaign']['name']} "
+                f"({row['campaign']['bidding_strategy_type']})"
+                for row in serving
+            )
+            raise SpendConfirmationRequired(
+                f"Changing what counts as a conversion changes what these "
+                f"serving campaigns bid toward, from the next auction: "
+                f"{names}. Together they spend up to {round(daily, 2)}/day, "
+                f"about {round(daily * 30.4, 2)}/month in the account's "
+                f"currency, and they re-enter the learning phase. Show this "
+                f"to the user and call again with confirm_spend=True only "
+                f"after they agree."
+            )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("ConversionActionService")
+
+    operation = client.get_type("ConversionActionOperation")
+    action = operation.update
+    action.resource_name = service.conversion_action_path(
+        customer_id, conversion_action_id
+    )
+
+    paths = []
+    if include_in_conversions_metric is not None:
+        action.include_in_conversions_metric = include_in_conversions_metric
+        paths.append("include_in_conversions_metric")
+    if primary_for_goal is not None:
+        action.primary_for_goal = primary_for_goal
+        paths.append("primary_for_goal")
+    if default_value is not None:
+        action.value_settings.default_value = default_value
+        paths.append("value_settings.default_value")
+    if always_use_default_value is not None:
+        action.value_settings.always_use_default_value = (
+            always_use_default_value
+        )
+        paths.append("value_settings.always_use_default_value")
+    if click_lookback_days is not None:
+        action.click_through_lookback_window_days = click_lookback_days
+        paths.append("click_through_lookback_window_days")
+    if name is not None:
+        action.name = name
+        paths.append("name")
+    if status is not None:
+        action.status = getattr(
+            client.enums.ConversionActionStatusEnum, status
+        )
+        paths.append("status")
+
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
+    )
+    service.mutate_conversion_actions(
+        customer_id=customer_id, operations=[operation]
+    )
+
+    after = _read_back(
+        customer_id,
+        f"""
+        SELECT conversion_action.id, conversion_action.name,
+               conversion_action.status, conversion_action.type,
+               conversion_action.category,
+               conversion_action.include_in_conversions_metric,
+               conversion_action.primary_for_goal,
+               conversion_action.click_through_lookback_window_days,
+               conversion_action.value_settings.default_value
+        FROM conversion_action
+        WHERE conversion_action.id = {conversion_action_id}
+        """,
+    )
+
+    return {
+        "conversion_action_id": conversion_action_id,
+        "requested_fields": paths,
+        "before": before[0]["conversion_action"],
+        "after": after[0]["conversion_action"] if after else None,
+        "note": (
+            "'after' is the API's own read-back, not the request. Compare it "
+            "with 'before': a field the API silently refused shows up as "
+            "unchanged here."
         ),
     }

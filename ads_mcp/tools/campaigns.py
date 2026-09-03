@@ -1048,3 +1048,190 @@ def set_device_bid_modifiers(
             """,
         ),
     }
+
+
+@campaigns_mcp.tool
+def set_campaign_proximity(
+    customer_id: str,
+    campaign_id: str,
+    radius: float,
+    street_address: Optional[str] = None,
+    city_name: Optional[str] = None,
+    postal_code: Optional[str] = None,
+    country_code: str = "TR",
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    radius_units: str = "KILOMETERS",
+    bid_modifier: Optional[float] = None,
+    presence_only: bool = True,
+    replace_existing_locations: bool = False,
+) -> Dict[str, Any]:
+    """Targets a radius around a point -- the right shape for one shopfront.
+
+    District and city targeting are drawn by administration, not by how far
+    anyone will travel: a district can reach 15km inland while the street two
+    minutes away sits in the next district and is missed entirely. For a
+    single-location business a radius around the door matches real catchment.
+
+    Layer several radii to bid by distance: call this once per ring with its
+    own bid_modifier (0-3km at 1.2, 3-6km at 1.0, 6-10km at 0.75). Rings are
+    separate criteria and Google applies the tightest matching one.
+
+    `presence_only` also fixes the setting that quietly wastes local budgets:
+    Google's default counts people merely INTERESTED in the area, so someone
+    searching "maltepe berber" from another city still sees the ad. True
+    restricts to people actually there, which is what a walk-in business
+    wants.
+
+    Give either an address (street_address + city_name, Google geocodes it)
+    or latitude/longitude. Targeting never spends beyond the campaign budget,
+    so this needs no confirmation.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to target.
+        radius: How far from the point, in radius_units.
+        street_address: e.g. "Rifki Tongsir Cd. No:113".
+        city_name: e.g. "Maltepe".
+        postal_code: e.g. "34841". Sharpens geocoding.
+        country_code: Two-letter country, e.g. "TR".
+        latitude: Use instead of an address, e.g. 40.9412.
+        longitude: Use instead of an address, e.g. 29.1234.
+        radius_units: KILOMETERS or MILES.
+        bid_modifier: 1.2 bids 20% more inside this ring, 0.75 bids 25% less.
+            Omit for no adjustment.
+        presence_only: True targets people IN the area; False also targets
+            people merely interested in it. True is right for a shopfront.
+        replace_existing_locations: True removes the campaign's existing
+            location and proximity criteria first. Use it when moving from
+            district targeting to a radius, or the two stack and the wider
+            one wins.
+
+    Returns:
+        The campaign's geo targeting, read back after the change.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+
+    radius_units = radius_units.upper()
+    if radius_units not in {"KILOMETERS", "MILES"}:
+        raise ValueError("radius_units must be KILOMETERS or MILES.")
+    if radius <= 0:
+        raise ValueError("radius must be greater than zero.")
+
+    has_point = latitude is not None and longitude is not None
+    has_address = bool(street_address or city_name or postal_code)
+    if not has_point and not has_address:
+        raise ValueError(
+            "Give either latitude and longitude, or an address "
+            "(street_address / city_name / postal_code)."
+        )
+    if bid_modifier is not None and not 0.1 <= bid_modifier <= 10.0:
+        raise ValueError("bid_modifier must be between 0.1 and 10.0.")
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignCriterionService")
+    campaign_service = utils.get_googleads_service("CampaignService")
+    campaign_path = campaign_service.campaign_path(customer_id, campaign_id)
+
+    removed = []
+    if replace_existing_locations:
+        existing = _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.resource_name,
+                   campaign_criterion.type
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type IN (LOCATION, PROXIMITY)
+            """,
+        )
+        removals = []
+        for row in existing:
+            criterion = row["campaign_criterion"]
+            operation = client.get_type("CampaignCriterionOperation")
+            operation.remove = criterion["resource_name"]
+            removals.append(operation)
+            removed.append(criterion["resource_name"])
+        if removals:
+            service.mutate_campaign_criteria(
+                customer_id=customer_id, operations=removals
+            )
+
+    operation = client.get_type("CampaignCriterionOperation")
+    criterion = operation.create
+    criterion.campaign = campaign_path
+    criterion.proximity.radius = float(radius)
+    criterion.proximity.radius_units = getattr(
+        client.enums.ProximityRadiusUnitsEnum, radius_units
+    )
+    if has_point:
+        criterion.proximity.geo_point.latitude_in_micro_degrees = int(
+            round(latitude * 1_000_000)
+        )
+        criterion.proximity.geo_point.longitude_in_micro_degrees = int(
+            round(longitude * 1_000_000)
+        )
+    else:
+        if street_address:
+            criterion.proximity.address.street_address = street_address
+        if city_name:
+            criterion.proximity.address.city_name = city_name
+        if postal_code:
+            criterion.proximity.address.postal_code = postal_code
+        criterion.proximity.address.country_code = country_code.upper()
+    if bid_modifier is not None:
+        criterion.bid_modifier = float(bid_modifier)
+
+    service.mutate_campaign_criteria(
+        customer_id=customer_id, operations=[operation]
+    )
+
+    # "Presence or interest" is Google's default and the single most common
+    # reason a local campaign pays for clicks from other cities.
+    geo_setting = None
+    if presence_only is not None:
+        campaign_operation = client.get_type("CampaignOperation")
+        campaign = campaign_operation.update
+        campaign.resource_name = campaign_path
+        target_type = client.enums.PositiveGeoTargetTypeEnum
+        campaign.geo_target_type_setting.positive_geo_target_type = (
+            target_type.PRESENCE if presence_only
+            else target_type.PRESENCE_OR_INTEREST
+        )
+        client.copy_from(
+            campaign_operation.update_mask,
+            field_mask_pb2.FieldMask(
+                paths=["geo_target_type_setting.positive_geo_target_type"]
+            ),
+        )
+        campaign_service.mutate_campaigns(
+            customer_id=customer_id, operations=[campaign_operation]
+        )
+        geo_setting = "PRESENCE" if presence_only else "PRESENCE_OR_INTEREST"
+
+    return {
+        "campaign_id": campaign_id,
+        "radius": radius,
+        "radius_units": radius_units,
+        "bid_modifier": bid_modifier,
+        "positive_geo_target_type": geo_setting,
+        "removed_criteria": removed,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.type,
+                   campaign_criterion.bid_modifier,
+                   campaign_criterion.negative,
+                   campaign_criterion.proximity.radius,
+                   campaign_criterion.proximity.radius_units,
+                   campaign_criterion.proximity.address.city_name,
+                   campaign_criterion.proximity.address.street_address,
+                   campaign_criterion.location.geo_target_constant
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type IN (LOCATION, PROXIMITY)
+            """,
+        ),
+    }
