@@ -858,6 +858,11 @@ def get_keyword_performance(
     clauses = [
         _date_clause(date_range),
         "ad_group_criterion.status != 'REMOVED'",
+        # keyword_view carries NEGATIVE keywords too, and they have no
+        # metrics by definition. Left in, a list of exclusions appears as a
+        # long tail of keywords with zero impressions -- which reads as dead
+        # weight to cut, when it is the protection working.
+        "ad_group_criterion.negative = false",
     ]
     if campaign_id:
         clauses.append(f"campaign.id = {_clean_id(campaign_id)}")
