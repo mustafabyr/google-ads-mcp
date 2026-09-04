@@ -63,6 +63,21 @@ def _clean_id(value: str) -> str:
     return cleaned
 
 
+def _enum(block: Dict[str, Any], field: str) -> Any:
+    """Reads an enum field from a proto-plus dict.
+
+    proto-plus renames fields that collide with Python builtins, so the
+    `type` field of a message arrives in the dict as `type_`. Reading
+    `"type"` therefore silently returns None -- which is worse than an
+    error, because a filter written against it quietly matches nothing.
+    """
+    if block is None:
+        return None
+    if field in block:
+        return block[field]
+    return block.get(field + "_")
+
+
 def _read_back(customer_id: str, query: str) -> List[Dict[str, Any]]:
     ga_service = utils.get_googleads_service("GoogleAdsService")
     rows = []
@@ -108,8 +123,58 @@ def _link_assets_to_campaign(
     return len(operations)
 
 
+# Which asset sub-message carries the content, per extension type. The raw
+# proto puts every unset sub-message in the row as well, so a listing that
+# returns rows verbatim is mostly empty scaffolding -- 13 extensions came back
+# as roughly 8k tokens of it. One entry per type keeps the output to what the
+# extension actually says.
+_ASSET_CONTENT_FIELD = {
+    "SITELINK": "sitelink_asset",
+    "CALLOUT": "callout_asset",
+    "STRUCTURED_SNIPPET": "structured_snippet_asset",
+    "CALL": "call_asset",
+    "PROMOTION": "promotion_asset",
+    "PRICE": "price_asset",
+}
+
+# LOCATION is deliberately absent above. It is a valid AssetFieldType, but
+# `campaign_asset.field_type = 'LOCATION'` is rejected by GAQL with
+# BAD_ENUM_CONSTANT: a campaign's addresses are not campaign_assets at all,
+# they arrive through an AssetSet synced from Business Profile. Use
+# list_location_asset_sets for those.
+
+
+def _flatten_extension(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Turns one campaign_asset row into a flat, readable record."""
+    link = row.get("campaign_asset", {})
+    asset = row.get("asset", {})
+    field_type = link.get("field_type")
+
+    out: Dict[str, Any] = {
+        "type": field_type,
+        "status": link.get("status"),
+        "asset_id": asset.get("id"),
+        "asset_name": asset.get("name"),
+        "campaign_asset_resource_name": link.get("resource_name"),
+    }
+
+    content = asset.get(_ASSET_CONTENT_FIELD.get(field_type, ""), {})
+    for key, value in content.items():
+        # ad_schedule_targets is an empty list on virtually every asset and
+        # start/end date are empty strings unless someone set them.
+        if key == "ad_schedule_targets" or value in ("", [], None):
+            continue
+        out[key] = value
+
+    urls = asset.get("final_urls") or []
+    if urls:
+        out["final_urls"] = urls
+    return out
+
+
 def _campaign_extensions(customer_id: str, campaign_id: str) -> List[Dict]:
-    return _read_back(
+    """Lists a campaign's extensions as flat records, one per link."""
+    rows = _read_back(
         customer_id,
         f"""
         SELECT campaign.id,
@@ -125,14 +190,20 @@ def _campaign_extensions(customer_id: str, campaign_id: str) -> List[Dict]:
                asset.call_asset.phone_number,
                asset.call_asset.country_code,
                asset.call_asset.call_conversion_reporting_state,
+               asset.call_asset.call_conversion_action,
+               asset.promotion_asset.promotion_target,
+               asset.promotion_asset.discount_modifier,
+               asset.promotion_asset.percent_off,
                asset.final_urls
         FROM campaign_asset
         WHERE campaign.id = {campaign_id}
           AND campaign_asset.field_type IN
-              ('SITELINK', 'CALLOUT', 'STRUCTURED_SNIPPET', 'CALL')
+              ('SITELINK', 'CALLOUT', 'STRUCTURED_SNIPPET', 'CALL',
+               'PROMOTION')
           AND campaign_asset.status != 'REMOVED'
         """,
     )
+    return [_flatten_extension(row) for row in rows]
 
 
 @extensions_mcp.tool
@@ -351,7 +422,13 @@ def list_campaign_extensions(
     customer_id: str,
     campaign_id: str,
 ) -> List[Dict[str, Any]]:
-    """Lists the sitelinks, callouts and structured snippets on a campaign.
+    """Lists the extensions linked to a campaign, as flat records.
+
+    Covers sitelinks, callouts, structured snippets, call and promotion
+    assets. Each row is the extension's own content plus its asset_id and
+    status -- not the raw proto, which is mostly unset fields. Address
+    extensions are NOT here: they come from an asset set synced from
+    Business Profile, which list_location_asset_sets reports.
 
     Check this before adding: extensions are assets that get LINKED, so
     running add_sitelinks twice does not update the first set, it creates a
@@ -498,7 +575,7 @@ def add_call_extension(
     existing = [
         row
         for row in _campaign_extensions(customer_id, campaign_id)
-        if row["campaign_asset"]["field_type"] == "CALL"
+        if row.get("type") == "CALL"
     ]
     if existing and not replace_existing:
         return {
@@ -755,4 +832,152 @@ def update_call_extension(
         )[0]["asset"],
         "call_reporting_setting": setting,
         "warnings": warnings,
+    }
+
+
+# --------------------------------------------------------------------------
+# Location extensions
+#
+# Location extensions do not work like the others. A sitelink is an asset you
+# write; a location comes from the advertiser's Google Business Profile,
+# which Google syncs into an ASSET SET. So there is nothing to create here --
+# the work is finding the synced set and attaching it to the campaigns that
+# should show an address.
+# --------------------------------------------------------------------------
+
+_LOCATION_SET_TYPES = {
+    "LOCATION_SYNC",
+    "BUSINESS_PROFILE_DYNAMIC_LOCATION_GROUP",
+    "CHAIN_DYNAMIC_LOCATION_GROUP",
+    "STATIC_LOCATION_GROUP",
+}
+
+
+def _campaign_asset_sets(customer_id: str, campaign_id: str) -> List[Dict]:
+    rows = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign.id, asset_set.id, asset_set.name, asset_set.type,
+               campaign_asset_set.status
+        FROM campaign_asset_set
+        WHERE campaign.id = {campaign_id}
+          AND campaign_asset_set.status != 'REMOVED'
+        """,
+    )
+    return [
+        {
+            "asset_set_id": row["asset_set"]["id"],
+            "name": row["asset_set"]["name"],
+            "type": _enum(row["asset_set"], "type"),
+            "status": row["campaign_asset_set"].get("status"),
+        }
+        for row in rows
+    ]
+
+
+@extensions_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def list_location_asset_sets(
+    customer_id: str,
+) -> Dict[str, Any]:
+    """Lists the location asset sets Google synced from Business Profile.
+
+    If this comes back empty, no Google Business Profile is linked to the
+    account and no campaign can show an address. That link is made in the
+    Google Ads interface, not through the API, and it is worth checking on
+    every local-business account: an address extension is one of the few
+    things that both raises click-through rate and pre-qualifies the click
+    by showing how far away the shop is.
+
+    Args:
+        customer_id: The Google Ads account id.
+
+    Returns:
+        The location asset sets, with a note when none exist.
+    """
+    customer_id = _clean_id(customer_id)
+    rows = _read_back(
+        customer_id,
+        """
+        SELECT asset_set.id, asset_set.name, asset_set.type,
+               asset_set.status
+        FROM asset_set
+        WHERE asset_set.status = 'ENABLED'
+        """,
+    )
+    sets = [
+        {
+            "asset_set_id": row["asset_set"]["id"],
+            "name": row["asset_set"]["name"],
+            "type": _enum(row["asset_set"], "type"),
+        }
+        for row in rows
+        if _enum(row["asset_set"], "type") in _LOCATION_SET_TYPES
+    ]
+    result: Dict[str, Any] = {"location_asset_sets": sets}
+    if not sets:
+        result["note"] = (
+            "No location asset set exists, so no campaign in this account "
+            "can show an address. Link the Google Business Profile in the "
+            "Google Ads interface first; the API cannot make that link."
+        )
+    return result
+
+
+@extensions_mcp.tool
+def attach_location_asset_set(
+    customer_id: str,
+    campaign_id: str,
+    asset_set_id: str,
+) -> Dict[str, Any]:
+    """Attaches a location asset set to a campaign, so its ads show an address.
+
+    Adding an extension does not raise the bid or the budget; it makes the ad
+    bigger and more specific, which usually raises click-through rate. On a
+    local account it also filters: someone who sees the address and the
+    distance and still clicks is closer to walking in.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign that should show the address.
+        asset_set_id: From list_location_asset_sets.
+
+    Returns:
+        The campaign's asset sets afterwards.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+    asset_set_id = _clean_id(asset_set_id)
+
+    already = {
+        str(entry["asset_set_id"])
+        for entry in _campaign_asset_sets(customer_id, campaign_id)
+    }
+    if asset_set_id in already:
+        return {
+            "campaign_id": campaign_id,
+            "asset_set_id": asset_set_id,
+            "attached": False,
+            "reason": "Already attached to this campaign.",
+            "verified": _campaign_asset_sets(customer_id, campaign_id),
+        }
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignAssetSetService")
+    operation = client.get_type("CampaignAssetSetOperation")
+    link = operation.create
+    link.campaign = utils.get_googleads_service(
+        "CampaignService"
+    ).campaign_path(customer_id, campaign_id)
+    link.asset_set = (
+        f"customers/{customer_id}/assetSets/{asset_set_id}"
+    )
+    service.mutate_campaign_asset_sets(
+        customer_id=customer_id, operations=[operation]
+    )
+
+    return {
+        "campaign_id": campaign_id,
+        "asset_set_id": asset_set_id,
+        "attached": True,
+        "verified": _campaign_asset_sets(customer_id, campaign_id),
     }

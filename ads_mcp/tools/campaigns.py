@@ -418,15 +418,20 @@ def set_campaign_status(
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("CampaignService")
     operation = client.get_type("CampaignOperation")
-    operation.update.resource_name = service.campaign_path(
-        customer_id, campaign_id
-    )
-    operation.update.status = getattr(
-        client.enums.CampaignStatusEnum, status
-    )
-    client.copy_from(
-        operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
-    )
+    resource_name = service.campaign_path(customer_id, campaign_id)
+
+    if status == "REMOVED":
+        # Deletion is its own operation, not a status update.
+        operation.remove = resource_name
+    else:
+        operation.update.resource_name = resource_name
+        operation.update.status = getattr(
+            client.enums.CampaignStatusEnum, status
+        )
+        client.copy_from(
+            operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
+        )
+
     service.mutate_campaigns(customer_id=customer_id, operations=[operation])
 
     return {

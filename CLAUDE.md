@@ -40,6 +40,18 @@ Enforced in code, not by convention. Every tool added here must keep it.
    several. Bids are gated separately, because they raise cost per click
    regardless of which campaign they sit under.
 
+## Claims and thresholds
+
+Every numeric threshold this repo or its skills rely on is registered in
+`docs/kaynaklar.md` with a status: DOKUMAN (Google-documented), GOZLEM
+(observed API behaviour, with a request id), KOD (read from the client
+library), or KONVANSIYON (industry convention, NOT verified against current
+Google documentation).
+
+Adding a threshold to a tool docstring or a skill without a row in that file
+is not allowed. A KONVANSIYON row is never presented to a client as "Google
+says so". Rows older than 12 months get re-verified or demoted.
+
 ## Money units
 
 Google Ads uses **micros**: 1 unit of account currency = 1_000_000.
@@ -163,6 +175,65 @@ These cost a debugging session each. Check them in every new tool.
   the second dot to fit 79 columns fails with `UNEXPECTED_INPUT: unexpected
   input ..` -- and if the query sits AFTER a mutate, the write has already
   landed while the tool reports failure. Keep long field paths on one line.
+- An RSA's `final_url` cannot be edited: `update_ad_text` only replaces
+  headlines and descriptions. A wrong landing page therefore costs the whole
+  ad -- create a replacement with the right URL, then pause the bad one. So
+  NEVER type a domain from memory or from what a business "probably" uses:
+  copy the final URL from an already-approved ad in the same account, or
+  fetch the page and confirm it resolves, before creating the ad.
+- `set_ad_status` builds an UPDATE operation, so status REMOVED is refused
+  with `INVALID_ENUM_VALUE: Enum value 'REMOVED' cannot be used`. Removal
+  needs a `remove` operation carrying the resource name, not an update.
+  Until that is implemented, PAUSED is the reachable end state.
+- A new tool module is NOT picked up on its own. `coordinator.py` finds the
+  FastMCP sub-server by reflection, but then asks `tools_config.yaml` whether
+  that namespace is enabled -- and a namespace missing from the file resolves
+  to False. A new module without a line there registers zero tools, with no
+  error and no log. Add the namespace to `ads_mcp/tools_config.yaml` in the
+  same commit as the module.
+- Never call one tool from another through FastMCP's wrapper (`tool.fn`).
+  Put the shared logic in a plain private helper and have both call that;
+  the wrapper's shape is framework internals and changes between versions.
+- `metrics.conversions` counts ONLY conversion actions whose
+  `include_in_conversions_metric` is true -- the number Smart Bidding
+  optimises against. `metrics.all_conversions` counts everything recorded.
+  A report that selects only the first reads as "this account converts
+  nothing" on an account doing hundreds a week. Select both, and say so when
+  they differ.
+- `metrics.search_budget_lost_impression_share` is campaign-only: a budget
+  belongs to a campaign, so selecting it FROM ad_group is refused with
+  "could not support requested resources: 'AD_GROUP'". Rank-lost share and
+  plain impression share ARE available at ad group level.
+- `change_event` filters on `change_event.change_date_time`, not
+  `segments.date`, and Google keeps only about 30 days of it.
+- proto-plus returns UNSET sub-fields as `""`, `0` or `"UNSPECIFIED"` rather
+  than omitting them, so one criterion row carries fifteen empty fields for
+  the one that is set. Filter before returning, or the output is mostly
+  scaffolding -- 13 campaign extensions came back as roughly 8k tokens of it.
+- `quality_info.quality_score` of 0 means "not enough traffic to score",
+  not "scored badly". Returning the 0 invites pausing a keyword that simply
+  has not run.
+- Location extensions cannot be created through the API. Google syncs the
+  advertiser's Business Profile into an AssetSet (`LOCATION_SYNC`), and the
+  API's job is to attach that set to campaigns. If no such asset set exists,
+  the Business Profile is not linked and only the Google Ads interface can
+  link it.
+- proto-plus renames a message field that collides with a Python builtin,
+  so a message's `type` arrives in the dict as `type_`. Reading `"type"`
+  returns None silently, and a FILTER written against it matches nothing --
+  that is how list_location_asset_sets reported "no Business Profile linked"
+  on an account that had one. Read enums through the `_enum` helper.
+- `Label` has no `description` field; the text lives on
+  `label.text_label.description` next to `background_color`.
+- `ConversionUploadService` is closed to new integrations. Google answers
+  "Usage of ConversionUploadService.UploadClickConversions is limited to
+  existing users" and points at the separate Data Manager API. The call
+  still returns success, so the per-row `api_errors` must be read before
+  telling anyone the conversions were recorded.
+- Every tool that CREATES something needs the tool that removes it, in the
+  same commit. An experiment, a shared set or a demographic exclusion that
+  can be created and not undone leaves the account dirty and leaves the
+  next session guessing.
 - A GAQL query must SELECT any field it filters on. `FROM campaign_asset
   WHERE campaign.id = X` fails unless `campaign.id` is also selected.
 - Performance Max has to be built in ONE atomic `GoogleAdsService.mutate`

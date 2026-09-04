@@ -180,13 +180,19 @@ def set_ad_group_status(
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("AdGroupService")
     operation = client.get_type("AdGroupOperation")
-    operation.update.resource_name = service.ad_group_path(
-        customer_id, _clean_id(ad_group_id)
-    )
-    operation.update.status = getattr(client.enums.AdGroupStatusEnum, status)
-    client.copy_from(
-        operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
-    )
+    resource_name = service.ad_group_path(customer_id, _clean_id(ad_group_id))
+
+    if status == "REMOVED":
+        operation.remove = resource_name
+    else:
+        operation.update.resource_name = resource_name
+        operation.update.status = getattr(
+            client.enums.AdGroupStatusEnum, status
+        )
+        client.copy_from(
+            operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
+        )
+
     service.mutate_ad_groups(customer_id=customer_id, operations=[operation])
 
     return {
@@ -674,16 +680,20 @@ def set_keyword_status(
     operations = []
     for criterion_id in criterion_ids:
         operation = client.get_type("AdGroupCriterionOperation")
-        operation.update.resource_name = service.ad_group_criterion_path(
+        resource_name = service.ad_group_criterion_path(
             customer_id, ad_group_id, _clean_id(criterion_id)
         )
-        operation.update.status = getattr(
-            client.enums.AdGroupCriterionStatusEnum, status
-        )
-        client.copy_from(
-            operation.update_mask,
-            field_mask_pb2.FieldMask(paths=["status"]),
-        )
+        if status == "REMOVED":
+            operation.remove = resource_name
+        else:
+            operation.update.resource_name = resource_name
+            operation.update.status = getattr(
+                client.enums.AdGroupCriterionStatusEnum, status
+            )
+            client.copy_from(
+                operation.update_mask,
+                field_mask_pb2.FieldMask(paths=["status"]),
+            )
         operations.append(operation)
 
     service.mutate_ad_group_criteria(
@@ -1019,15 +1029,22 @@ def set_ad_status(
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("AdGroupAdService")
     operation = client.get_type("AdGroupAdOperation")
-    operation.update.resource_name = service.ad_group_ad_path(
-        customer_id, ad_group_id, ad_id
-    )
-    operation.update.status = getattr(
-        client.enums.AdGroupAdStatusEnum, status
-    )
-    client.copy_from(
-        operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
-    )
+    resource_name = service.ad_group_ad_path(customer_id, ad_group_id, ad_id)
+
+    if status == "REMOVED":
+        # Deletion is its own operation. Setting status=REMOVED through an
+        # update is refused with INVALID_ENUM_VALUE: "Enum value 'REMOVED'
+        # cannot be used" -- see docs/kaynaklar.md.
+        operation.remove = resource_name
+    else:
+        operation.update.resource_name = resource_name
+        operation.update.status = getattr(
+            client.enums.AdGroupAdStatusEnum, status
+        )
+        client.copy_from(
+            operation.update_mask, field_mask_pb2.FieldMask(paths=["status"])
+        )
+
     service.mutate_ad_group_ads(customer_id=customer_id, operations=[operation])
 
     return {
@@ -1051,13 +1068,21 @@ def update_ad_text(
     ad_id: str,
     headlines: Optional[List[str]] = None,
     descriptions: Optional[List[str]] = None,
+    final_url: Optional[str] = None,
+    path1: Optional[str] = None,
+    path2: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Replaces the headlines and/or descriptions of a responsive search ad.
+    """Edits a responsive search ad's copy, landing page or display paths.
 
     Whichever list you pass REPLACES that list entirely -- pass every headline
     you want the ad to keep, not just the new ones. The character limits are
     checked here first, so a too-long line fails with its own text and length
     instead of an opaque API error.
+
+    `final_url` exists so a wrong landing page costs an edit rather than the
+    whole ad. It does NOT excuse guessing: a URL that does not resolve gets
+    the ad disapproved, so copy it from an already-approved ad in the same
+    account or confirm the page loads before calling.
 
     Editing an ad sends it back to Google for review and resets its
     performance history, so prefer it for fixing copy; to test a new angle,
@@ -1070,6 +1095,11 @@ def update_ad_text(
             the current ones.
         descriptions: 2-4 descriptions, each at most 90 characters. Omit to
             keep the current ones.
+        final_url: The landing page. Must be a verified, resolving http(s)
+            URL. Omit to keep the current one.
+        path1: First display path segment, at most 15 characters. Pass an
+            empty string to clear it.
+        path2: Second display path segment. Needs path1 to be set.
 
     Returns:
         What was replaced, and the ad read back.
@@ -1077,8 +1107,30 @@ def update_ad_text(
     customer_id = _clean_id(customer_id)
     ad_id = _clean_id(ad_id)
 
-    if headlines is None and descriptions is None:
-        raise ValueError("Give headlines, descriptions, or both.")
+    if all(
+        v is None
+        for v in (headlines, descriptions, final_url, path1, path2)
+    ):
+        raise ValueError(
+            "Give at least one of headlines, descriptions, final_url, "
+            "path1 or path2."
+        )
+
+    if final_url is not None:
+        final_url = final_url.strip()
+        if not final_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"final_url must start with http:// or https://, got "
+                f"{final_url!r}."
+            )
+    for name, value in (("path1", path1), ("path2", path2)):
+        if value is not None and len(value) > _MAX_PATH_CHARS:
+            raise ValueError(
+                f"{name} is {len(value)} characters, limit is "
+                f"{_MAX_PATH_CHARS}: {value!r}"
+            )
+    if path2 and not path1:
+        raise ValueError("path2 needs path1 to be set as well.")
 
     if headlines is not None:
         if not _MIN_HEADLINES <= len(headlines) <= _MAX_HEADLINES:
@@ -1125,6 +1177,15 @@ def update_ad_text(
             asset.text = text
             ad.responsive_search_ad.descriptions.append(asset)
         paths.append("responsive_search_ad.descriptions")
+    if final_url is not None:
+        ad.final_urls.append(final_url)
+        paths.append("final_urls")
+    if path1 is not None:
+        ad.responsive_search_ad.path1 = path1
+        paths.append("responsive_search_ad.path1")
+    if path2 is not None:
+        ad.responsive_search_ad.path2 = path2
+        paths.append("responsive_search_ad.path2")
 
     client.copy_from(
         operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
@@ -1133,8 +1194,10 @@ def update_ad_text(
 
     return {
         "ad_id": ad_id,
+        "fields_changed": paths,
         "headlines_replaced": len(headlines) if headlines else 0,
         "descriptions_replaced": len(descriptions) if descriptions else 0,
+        "final_url": final_url,
         "note": (
             "The edited ad goes back to Google for review. The parent campaign "
             "is still the spend gate."
@@ -1143,9 +1206,11 @@ def update_ad_text(
             customer_id,
             f"""
             SELECT ad_group_ad.ad.id,
-                   ad_group_ad.ad.responsive_search_ad.headlines,
-                   ad_group_ad.ad.responsive_search_ad.descriptions,
+                   ad_group_ad.ad.final_urls,
+                   ad_group_ad.ad.responsive_search_ad.path1,
+                   ad_group_ad.ad.responsive_search_ad.path2,
                    ad_group_ad.status,
+                   ad_group_ad.ad_strength,
                    ad_group_ad.policy_summary.approval_status
             FROM ad_group_ad WHERE ad_group_ad.ad.id = {ad_id}
             """,

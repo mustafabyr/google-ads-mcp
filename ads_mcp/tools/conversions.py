@@ -659,3 +659,256 @@ def update_conversion_action(
             "unchanged here."
         ),
     }
+
+
+# --------------------------------------------------------------------------
+# Offline conversion import
+#
+# The point of this is closing the loop. A Search ad produces a click; the
+# click produces a phone call or a form; days later that becomes a booking
+# somebody actually paid for. Google only ever saw the click. Uploading the
+# outcome back, keyed on the click id, is what lets bidding optimise towards
+# revenue instead of towards form submissions.
+# --------------------------------------------------------------------------
+
+
+@conversions_mcp.tool
+def upload_offline_conversions(
+    customer_id: str,
+    conversion_action_id: str,
+    conversions: List[Dict[str, Any]],
+    partial_failure: bool = True,
+) -> Dict[str, Any]:
+    """Uploads conversions that happened offline, keyed on the Google click id.
+
+    CHECK THIS FIRST: Google has closed UploadClickConversions to new
+    integrations. An account that was not already using it gets
+    "Usage of ConversionUploadService.UploadClickConversions is limited to
+    existing users" and nothing is recorded -- the call succeeds, the
+    conversions do not arrive. New integrations have to go through the
+    separate Data Manager API, which this server does not speak. The tool
+    still works for accounts already grandfathered in, and surfaces that
+    error verbatim in `api_errors` for the rest.
+
+    Each entry needs the GCLID that Google put on the landing page URL, the
+    time the conversion happened, and optionally what it was worth. The
+    account must have auto-tagging ON or there is no GCLID to key on --
+    get_account_settings reports that.
+
+    Two rules Google enforces and this checks first, because the API's own
+    error for them is opaque:
+      * The conversion time must be AFTER the click. Uploading a booking
+        dated before its own click is rejected.
+      * conversion_date_time needs an explicit timezone offset, in the form
+        "2026-09-01 14:30:00+03:00". A bare timestamp is rejected.
+
+    Args:
+        customer_id: The Google Ads account id.
+        conversion_action_id: The conversion action to attribute these to. It
+            must be of an upload type; create_conversion_action makes one.
+        conversions: One dict per conversion, with keys:
+            gclid (required, or gbraid / wbraid for app and iOS traffic),
+            conversion_date_time (required, with offset),
+            conversion_value (optional number),
+            currency_code (optional, defaults to the account's),
+            order_id (optional, dedupes re-uploads).
+        partial_failure: True to accept the valid rows and report the bad
+            ones, instead of rejecting the whole batch. Usually what you
+            want for a spreadsheet export.
+
+    Returns:
+        How many were accepted, and the per-row errors for the rest.
+    """
+    customer_id = _clean_id(customer_id)
+    conversion_action_id = _clean_id(conversion_action_id)
+    if not conversions:
+        raise ValueError("Give at least one conversion.")
+
+    client = utils.get_googleads_client()
+    action_path = utils.get_googleads_service(
+        "ConversionActionService"
+    ).conversion_action_path(customer_id, conversion_action_id)
+
+    uploads = []
+    rejected_locally = []
+    for index, entry in enumerate(conversions):
+        when = str(entry.get("conversion_date_time") or "").strip()
+        click_ids = {
+            key: entry.get(key)
+            for key in ("gclid", "gbraid", "wbraid")
+            if entry.get(key)
+        }
+        if not click_ids:
+            rejected_locally.append(
+                {"row": index, "reason": "no gclid, gbraid or wbraid"}
+            )
+            continue
+        if not when:
+            rejected_locally.append(
+                {"row": index, "reason": "no conversion_date_time"}
+            )
+            continue
+        if "+" not in when and "-" not in when[10:]:
+            rejected_locally.append(
+                {
+                    "row": index,
+                    "reason": (
+                        "conversion_date_time has no timezone offset; use "
+                        "'YYYY-MM-DD HH:MM:SS+03:00'"
+                    ),
+                }
+            )
+            continue
+
+        conversion = client.get_type("ClickConversion")
+        conversion.conversion_action = action_path
+        conversion.conversion_date_time = when
+        for key, value in click_ids.items():
+            setattr(conversion, key, value)
+        if entry.get("conversion_value") is not None:
+            conversion.conversion_value = float(entry["conversion_value"])
+            conversion.currency_code = entry.get("currency_code") or "TRY"
+        if entry.get("order_id"):
+            conversion.order_id = str(entry["order_id"])
+        uploads.append(conversion)
+
+    if not uploads:
+        return {
+            "uploaded": 0,
+            "rejected_before_sending": rejected_locally,
+            "note": "Nothing was sent: every row failed local validation.",
+        }
+
+    service = utils.get_googleads_service("ConversionUploadService")
+    response = service.upload_click_conversions(
+        customer_id=customer_id,
+        conversions=uploads,
+        partial_failure=partial_failure,
+    )
+
+    api_errors = []
+    failure = getattr(response, "partial_failure_error", None)
+    if failure is not None and getattr(failure, "message", ""):
+        api_errors.append(failure.message)
+
+    accepted = sum(
+        1 for result in response.results if result.conversion_date_time
+    )
+    return {
+        "sent": len(uploads),
+        "accepted": accepted,
+        "rejected_before_sending": rejected_locally,
+        "api_errors": api_errors,
+        "note": (
+            "Uploaded conversions can take up to 3 hours to appear in "
+            "reports, and only count if the click is inside the conversion "
+            "action's lookback window."
+        ),
+    }
+
+
+@conversions_mcp.tool
+def upload_call_conversions(
+    customer_id: str,
+    conversion_action_id: str,
+    calls: List[Dict[str, Any]],
+    partial_failure: bool = True,
+) -> Dict[str, Any]:
+    """Uploads the outcome of phone calls that came from ads.
+
+    The same restriction as upload_offline_conversions applies: Google
+    limits ConversionUploadService to accounts already using it, and points
+    new integrations at the Data Manager API. Check `api_errors` in the
+    result before believing anything was recorded.
+
+    This is how "the call turned into a booking" gets back to Google. It is
+    keyed on the caller's number and the time the call STARTED, which is what
+    a call-tracking export gives you, not on a click id.
+
+    Args:
+        customer_id: The Google Ads account id.
+        conversion_action_id: An upload-type conversion action for calls.
+        calls: One dict per call, with keys:
+            caller_id (required, in E.164, e.g. "+905301234567"),
+            call_start_date_time (required, with timezone offset),
+            conversion_date_time (required, with offset),
+            conversion_value (optional), currency_code (optional).
+        partial_failure: True to accept the valid rows and report the rest.
+
+    Returns:
+        How many were accepted, and the per-row errors for the rest.
+    """
+    customer_id = _clean_id(customer_id)
+    conversion_action_id = _clean_id(conversion_action_id)
+    if not calls:
+        raise ValueError("Give at least one call.")
+
+    client = utils.get_googleads_client()
+    action_path = utils.get_googleads_service(
+        "ConversionActionService"
+    ).conversion_action_path(customer_id, conversion_action_id)
+
+    uploads = []
+    rejected_locally = []
+    for index, entry in enumerate(calls):
+        caller = str(entry.get("caller_id") or "").strip()
+        started = str(entry.get("call_start_date_time") or "").strip()
+        when = str(entry.get("conversion_date_time") or "").strip()
+        if not caller.startswith("+"):
+            rejected_locally.append(
+                {
+                    "row": index,
+                    "reason": "caller_id must be E.164, starting with '+'",
+                }
+            )
+            continue
+        if not started or not when:
+            rejected_locally.append(
+                {
+                    "row": index,
+                    "reason": (
+                        "both call_start_date_time and conversion_date_time "
+                        "are required, each with a timezone offset"
+                    ),
+                }
+            )
+            continue
+
+        conversion = client.get_type("CallConversion")
+        conversion.conversion_action = action_path
+        conversion.caller_id = caller
+        conversion.call_start_date_time = started
+        conversion.conversion_date_time = when
+        if entry.get("conversion_value") is not None:
+            conversion.conversion_value = float(entry["conversion_value"])
+            conversion.currency_code = entry.get("currency_code") or "TRY"
+        uploads.append(conversion)
+
+    if not uploads:
+        return {
+            "uploaded": 0,
+            "rejected_before_sending": rejected_locally,
+            "note": "Nothing was sent: every row failed local validation.",
+        }
+
+    service = utils.get_googleads_service("ConversionUploadService")
+    response = service.upload_call_conversions(
+        customer_id=customer_id,
+        conversions=uploads,
+        partial_failure=partial_failure,
+    )
+
+    api_errors = []
+    failure = getattr(response, "partial_failure_error", None)
+    if failure is not None and getattr(failure, "message", ""):
+        api_errors.append(failure.message)
+
+    accepted = sum(
+        1 for result in response.results if result.conversion_date_time
+    )
+    return {
+        "sent": len(uploads),
+        "accepted": accepted,
+        "rejected_before_sending": rejected_locally,
+        "api_errors": api_errors,
+    }
