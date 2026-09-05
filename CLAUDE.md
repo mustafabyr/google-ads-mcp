@@ -234,6 +234,12 @@ These cost a debugging session each. Check them in every new tool.
   same commit. An experiment, a shared set or a demographic exclusion that
   can be created and not undone leaves the account dirty and leaves the
   next session guessing.
+- An ad schedule turns a day OFF by that day being ABSENT, so a tool that
+  only adds entries cannot express "not on Sunday" at all: passing
+  Monday-to-Saturday leaves an existing Sunday entry serving, and the
+  read-back looks fine because the six days asked for are all there.
+  `set_campaign_ad_schedule` therefore clears the existing schedule by
+  default -- a tool named "set" must set.
 - A GAQL query must SELECT any field it filters on. `FROM campaign_asset
   WHERE campaign.id = X` fails unless `campaign.id` is also selected.
 - Performance Max has to be built in ONE atomic `GoogleAdsService.mutate`

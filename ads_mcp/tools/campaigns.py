@@ -564,12 +564,19 @@ def set_campaign_ad_schedule(
     customer_id: str,
     campaign_id: str,
     schedule: List[Dict[str, Any]],
+    replace_existing: bool = True,
 ) -> Dict[str, Any]:
     """Sets when a campaign is allowed to serve, in the ACCOUNT'S time zone.
 
     A campaign with no ad schedule runs all week. Once any schedule entry
-    exists, the campaign serves ONLY inside the entries you add — so add every
-    day you want covered in one call.
+    exists, the campaign serves ONLY inside the entries that exist — so the
+    schedule you pass must list EVERY block the campaign should run in.
+
+    `replace_existing` defaults to True, so this behaves like its name: the
+    schedule you pass becomes the whole schedule. That matters because a day
+    is turned OFF by being absent, and an add-only version of this tool
+    cannot express that at all -- passing Monday-to-Saturday would silently
+    leave an existing Sunday entry serving.
 
     Args:
         customer_id: The Google Ads account id.
@@ -579,6 +586,9 @@ def set_campaign_ad_schedule(
              {"day": "TUESDAY", "start_hour": 9, "end_hour": 23}]
             Hours are 0-24. Minutes may be 0, 15, 30 or 45 via the optional
             "start_minute"/"end_minute" keys; end_hour 24 means midnight.
+        replace_existing: True (default) clears the campaign's current ad
+            schedule first, so the result is exactly what you passed. False
+            adds to what is already there, which can only widen the hours.
 
     Returns:
         The campaign's full ad schedule, read back after the change.
@@ -587,6 +597,27 @@ def set_campaign_ad_schedule(
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("CampaignCriterionService")
     campaign_service = utils.get_googleads_service("CampaignService")
+
+    removed = []
+    if replace_existing:
+        for row in _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.resource_name
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type = AD_SCHEDULE
+              AND campaign_criterion.status != 'REMOVED'
+            """,
+        ):
+            criterion = row["campaign_criterion"]
+            operation = client.get_type("CampaignCriterionOperation")
+            operation.remove = criterion["resource_name"]
+            service.mutate_campaign_criteria(
+                customer_id=customer_id, operations=[operation]
+            )
+            removed.append(criterion["criterion_id"])
 
     minute_enum = client.enums.MinuteOfHourEnum
     minute_names = {0: "ZERO", 15: "FIFTEEN", 30: "THIRTY", 45: "FORTY_FIVE"}
@@ -634,9 +665,10 @@ def set_campaign_ad_schedule(
     return {
         "campaign_id": campaign_id,
         "added": len(operations),
+        "removed": removed,
         "note": (
             "The campaign now serves ONLY during these blocks, in the "
-            "account's time zone."
+            "account's time zone. Any day not listed is OFF."
         ),
         "verified": _read_back(
             customer_id,
