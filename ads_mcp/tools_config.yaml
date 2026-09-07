@@ -19,3 +19,4 @@ namespaces:
   targeting: true
   agency: true
   experiments: true
+  audit: true

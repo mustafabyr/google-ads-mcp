@@ -74,6 +74,7 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 | `extensions.py` | `extensions` | sitelinks, callouts, structured snippets, call extensions (add + repoint) |
 | `conversions.py` | `conversions` | conversion actions (create + update), tag snippets, campaign conversion goals |
 | `adgroups.py` | `adgroups` | ad groups, responsive search ads and their text, ad status, keywords and their bids/match types/status, negative keywords |
+| `audit.py` | `audit` | the agency checklist as one call: `run_account_audit` for one account, `run_portfolio_audit` for every account under an MCC with findings grouped across accounts |
 | `core.py`, `search.py`, `get_resource_metadata.py` | — | Google's originals, unmodified |
 
 ## Environment
@@ -282,6 +283,20 @@ These cost a debugging session each. Check them in every new tool.
   `maximize_conversion_value.target_roas`. The standalone `target_cpa` /
   `target_roas` messages are rejected on Search campaigns with
   `OPERATION_NOT_PERMITTED_FOR_CONTEXT`.
+
+## The audit is where a lesson goes to live
+
+A mistake found in one account is worth almost nothing as a note in a
+report someone read once. It is worth something as a check in
+`audit.py`, because then it runs against every account, forever, without
+anyone remembering to look.
+
+So: when a real problem is found in a live account — not a hypothesis, a
+problem that cost money or reach — the fix is not finished until there
+is a check for it in `audit.py`. Every check in that file has a live
+account behind it, and none of them were invented from a best-practices
+list. Keep it that way; a checklist padded with plausible-sounding
+checks stops being read.
 
 ## Still to build
 

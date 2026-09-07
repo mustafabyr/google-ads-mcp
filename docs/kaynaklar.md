@@ -56,6 +56,10 @@ yıl sonra yanlış bilgi kaynağıdır — bu dosya onu engellemek için var.
 | 28 | Gösterim payı alanlarında 0,0999 "%10'dan az", 0,9001 "%90'dan çok" demektir | `KONVANSİYON` | Hesap 644-051-8752'de dört kampanyada 0,0999 gözlendi; Google dokümanında doğrulanacak | — |
 | 29 | proto-plus, Python'da çakışan alan adlarını yeniden adlandırır: mesajın `type` alanı sözlükte `type_` olur | `GÖZLEM` | Altı araçta sessiz `null`; konum varlık kümesi filtresi hiçbir şeyle eşleşmedi | 2026-09-04 |
 | 30 | `campaign_asset.field_type = 'LOCATION'` GAQL'de reddedilir; adres uzantısı campaign_asset değil, Business Profile'dan senkronlanan AssetSet'tir | `GÖZLEM` | `BAD_ENUM_CONSTANT`, istek kimliği `Abcjmjin-VKKTKIMnj2IrQ` | 2026-09-04 |
+| 31 | `customer_client.manager = false` filtresi alt hesapları verir; MCC'nin kendisi manager=true olduğu için listeye girmez | `DOKÜMAN` | https://developers.google.com/google-ads/api/fields/v25/customer_client | 2026-09-07 |
+| 32 | `change_event` sorgusu hem alt hem üst tarih sınırı ve `LIMIT` ister; tek sınırla hata döner | `DOKÜMAN` | https://developers.google.com/google-ads/api/docs/change-event | 2026-09-07 |
+| 33 | Öneriler otomatik uygulama API'den ne okunabilir ne kapatılabilir; tek kanıt `change_event.client_type` alanındaki robot istemcilerdir | `GÖZLEM` | Hesap 644-051-8752'de bir ayda 5 negatif kelime silinmesi | 2026-09-07 |
+| 34 | Dönüşümün teklife girip girmediğine eylemin `include_in_conversions_metric` alanı değil, hesabın (kategori, köken) anahtarlı dönüşüm hedefi karar verir | `GÖZLEM` | Hesap 493-540-3315: WhatsApp eylemi bayrak false, 1791 dönüşüm sayıldı; hesap toplamı 1931 = 1791 + 140 | 2026-09-07 |
 
 ## Kural
 
