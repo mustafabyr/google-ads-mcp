@@ -44,6 +44,23 @@ _DAYS = {
     "FRIDAY", "SATURDAY", "SUNDAY",
 }
 
+# Whether a location target means "is in the area" or "is interested in it".
+# Google's default is PRESENCE_OR_INTEREST, which reaches people anywhere in
+# the world who merely searched about the area.
+_POSITIVE_GEO_TYPES = {
+    "PRESENCE",
+    "PRESENCE_OR_INTEREST",
+    "SEARCH_INTEREST",
+}
+_NEGATIVE_GEO_TYPES = {"PRESENCE", "PRESENCE_OR_INTEREST"}
+
+# Where on the page Target Impression Share aims to appear.
+_IMPRESSION_SHARE_LOCATIONS = {
+    "ANYWHERE_ON_PAGE",
+    "TOP_OF_PAGE",
+    "ABSOLUTE_TOP_OF_PAGE",
+}
+
 
 class SpendConfirmationRequired(Exception):
     """Raised when an action would let money be spent without confirmation."""
@@ -555,6 +572,407 @@ def set_campaign_geo_targets(
 
 
 # --------------------------------------------------------------------------
+# Geo target type, languages and URL settings
+# --------------------------------------------------------------------------
+
+
+@campaigns_mcp.tool
+def set_campaign_geo_target_type(
+    customer_id: str,
+    campaign_id: str,
+    positive_geo_target_type: str = "PRESENCE",
+    negative_geo_target_type: Optional[str] = None,
+    confirm_widens_reach: bool = False,
+) -> Dict[str, Any]:
+    """Sets whether location targeting means presence or mere interest.
+
+    Google's default is PRESENCE_OR_INTEREST, which serves the ads to people
+    merely INTERESTED in the targeted area from anywhere else in the world.
+    For a business people have to walk into, that is usually the largest
+    single source of wasted spend, and it is invisible in a campaign report --
+    only a geo segment shows it.
+
+    Narrowing to PRESENCE can only reduce reach, so it needs no confirmation.
+    Widening back to PRESENCE_OR_INTEREST or SEARCH_INTEREST opens traffic
+    that was closed, which is the same class of change as removing a negative
+    keyword, so it requires confirm_widens_reach=True.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        positive_geo_target_type: PRESENCE (people in the area),
+            PRESENCE_OR_INTEREST (also people interested in it from
+            elsewhere -- Google's default), or SEARCH_INTEREST.
+        negative_geo_target_type: How EXCLUDED locations are matched:
+            PRESENCE or PRESENCE_OR_INTEREST. Omit to keep.
+        confirm_widens_reach: Required when the change opens traffic that
+            PRESENCE was keeping out.
+
+    Returns:
+        Old and new setting, and the campaign read back.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+
+    positive = positive_geo_target_type.upper()
+    if positive not in _POSITIVE_GEO_TYPES:
+        raise ValueError(
+            f"positive_geo_target_type must be one of "
+            f"{sorted(_POSITIVE_GEO_TYPES)}, not {positive_geo_target_type!r}."
+        )
+    negative = None
+    if negative_geo_target_type is not None:
+        negative = negative_geo_target_type.upper()
+        if negative not in _NEGATIVE_GEO_TYPES:
+            raise ValueError(
+                f"negative_geo_target_type must be one of "
+                f"{sorted(_NEGATIVE_GEO_TYPES)}, not "
+                f"{negative_geo_target_type!r}."
+            )
+
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign.geo_target_type_setting.positive_geo_target_type,
+               campaign.geo_target_type_setting.negative_geo_target_type
+        FROM campaign WHERE campaign.id = {campaign_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No campaign {campaign_id} in account {customer_id}.")
+
+    setting = current[0]["campaign"].get("geo_target_type_setting", {})
+    old_positive = str(setting.get("positive_geo_target_type", "UNSPECIFIED"))
+
+    if (
+        old_positive == "PRESENCE"
+        and positive != "PRESENCE"
+        and not confirm_widens_reach
+    ):
+        raise SpendConfirmationRequired(
+            f"'{current[0]['campaign']['name']}' currently serves only to "
+            f"people PRESENT in the targeted locations. Changing it to "
+            f"{positive} also serves people merely interested in those "
+            f"locations from anywhere else, which reopens traffic that is "
+            f"closed today. Show this to the user and call again with "
+            f"confirm_widens_reach=True only after they agree."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignService")
+    operation = client.get_type("CampaignOperation")
+    campaign = operation.update
+    campaign.resource_name = service.campaign_path(customer_id, campaign_id)
+
+    # The mask has to name a LEAF: masking geo_target_type_setting itself is
+    # rejected with FIELD_HAS_SUBFIELDS.
+    paths = ["geo_target_type_setting.positive_geo_target_type"]
+    campaign.geo_target_type_setting.positive_geo_target_type = getattr(
+        client.enums.PositiveGeoTargetTypeEnum, positive
+    )
+    if negative is not None:
+        campaign.geo_target_type_setting.negative_geo_target_type = getattr(
+            client.enums.NegativeGeoTargetTypeEnum, negative
+        )
+        paths.append("geo_target_type_setting.negative_geo_target_type")
+
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
+    )
+    service.mutate_campaigns(customer_id=customer_id, operations=[operation])
+
+    return {
+        "campaign_id": campaign_id,
+        "old_positive_geo_target_type": old_positive,
+        "new_positive_geo_target_type": positive,
+        "changed": paths,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign.id, campaign.name,
+                   campaign.geo_target_type_setting.positive_geo_target_type,
+                   campaign.geo_target_type_setting.negative_geo_target_type
+            FROM campaign WHERE campaign.id = {campaign_id}
+            """,
+        ),
+    }
+
+
+@campaigns_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def find_language_ids(
+    customer_id: str,
+    query: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Looks up language constant ids by name or two-letter code.
+
+    Call this before set_campaign_languages -- never guess a language id.
+    Matching is done here rather than in GAQL because language_constant does
+    not accept a LIKE filter on every field, and there are few enough
+    languages to filter in Python.
+
+    Args:
+        customer_id: The Google Ads account id.
+        query: Part of a language name ("Turkish") or its code ("tr").
+            Omit to list every targetable language.
+
+    Returns:
+        Matching languages with their id, code and name.
+    """
+    customer_id = _clean_id(customer_id)
+    rows = _read_back(
+        customer_id,
+        """
+        SELECT language_constant.id, language_constant.code,
+               language_constant.name, language_constant.targetable
+        FROM language_constant
+        """,
+    )
+
+    needle = (query or "").strip().lower()
+    out = []
+    for row in rows:
+        language = row["language_constant"]
+        if not language.get("targetable"):
+            continue
+        name = str(language.get("name", ""))
+        code = str(language.get("code", ""))
+        if needle and needle not in name.lower() and needle != code.lower():
+            continue
+        out.append(
+            {
+                "id": str(language.get("id")),
+                "code": code,
+                "name": name,
+                "resource_name": f"languageConstants/{language.get('id')}",
+            }
+        )
+    return out
+
+
+@campaigns_mcp.tool
+def set_campaign_languages(
+    customer_id: str,
+    campaign_id: str,
+    language_ids: List[str],
+    replace_existing: bool = True,
+) -> Dict[str, Any]:
+    """Sets which languages a campaign targets.
+
+    A campaign created through the API carries NO language criterion, and no
+    language criterion means ALL languages -- so a Turkish campaign quietly
+    serves against English-language sessions until this is set. That is not
+    visible in a campaign report either.
+
+    Language targeting matches the user's Google interface language and
+    recent browsing, NOT the language of the keyword, so this narrows who
+    sees the ad without touching which queries can match it.
+
+    `replace_existing` defaults to True, so this behaves like its name: a
+    language is turned OFF by being absent, and an add-only version could
+    not express that.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        language_ids: Language constant ids from find_language_ids,
+            e.g. ["1037"] for Turkish.
+        replace_existing: True (default) clears the campaign's current
+            language criteria first. False adds to what is there.
+
+    Returns:
+        The campaign's full language targeting, read back after the change.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+    if not language_ids:
+        raise ValueError(
+            "Give at least one language id. An empty list would leave the "
+            "campaign with no language criterion, which means ALL languages "
+            "-- pass the ids you want instead."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignCriterionService")
+    campaign_service = utils.get_googleads_service("CampaignService")
+
+    removed = []
+    if replace_existing:
+        for row in _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.resource_name
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type = LANGUAGE
+              AND campaign_criterion.status != 'REMOVED'
+            """,
+        ):
+            criterion = row["campaign_criterion"]
+            operation = client.get_type("CampaignCriterionOperation")
+            operation.remove = criterion["resource_name"]
+            service.mutate_campaign_criteria(
+                customer_id=customer_id, operations=[operation]
+            )
+            removed.append(criterion["criterion_id"])
+
+    operations = []
+    for language_id in language_ids:
+        operation = client.get_type("CampaignCriterionOperation")
+        criterion = operation.create
+        criterion.campaign = campaign_service.campaign_path(
+            customer_id, campaign_id
+        )
+        criterion.language.language_constant = (
+            f"languageConstants/{_clean_id(language_id)}"
+        )
+        operations.append(operation)
+
+    service.mutate_campaign_criteria(
+        customer_id=customer_id, operations=operations
+    )
+
+    return {
+        "campaign_id": campaign_id,
+        "added": len(operations),
+        "removed": removed,
+        "note": (
+            "The campaign now targets ONLY these languages. Any language not "
+            "listed is off."
+        ),
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.language.language_constant
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type = LANGUAGE
+            """,
+        ),
+    }
+
+
+def _validate_url_suffix(suffix: str) -> str:
+    """Checks a final URL suffix is the bare query string Google expects."""
+    cleaned = suffix.strip()
+    if not cleaned:
+        return ""
+    if cleaned[0] in "?&":
+        raise ValueError(
+            "final_url_suffix is appended to the landing page URL by Google, "
+            f"so it must NOT start with '?' or '&'. Pass {cleaned[1:]!r}."
+        )
+    if " " in cleaned:
+        raise ValueError(
+            "final_url_suffix cannot contain spaces; URL-encode them as %20."
+        )
+    for pair in cleaned.split("&"):
+        if "=" not in pair:
+            raise ValueError(
+                f"final_url_suffix must be key=value pairs joined by '&'. "
+                f"{pair!r} has no '='."
+            )
+    return cleaned
+
+
+@campaigns_mcp.tool
+def set_campaign_url_settings(
+    customer_id: str,
+    campaign_id: str,
+    final_url_suffix: Optional[str] = None,
+    tracking_url_template: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Sets the campaign's final URL suffix and/or tracking template.
+
+    The final URL suffix is where UTM parameters belong. Google appends it to
+    the landing page URL after any redirect, so analytics and CRM see the
+    campaign that produced the click without the ad's own final_url having to
+    carry the parameters -- which matters because an RSA's final_url cannot
+    be edited afterwards.
+
+    A suffix is per campaign, so a per-campaign utm_campaign value can only
+    be set here, not at account level.
+
+    The tracking template is the redirect mechanism itself and a wrong one
+    breaks EVERY landing page in the campaign, so it is left alone unless
+    explicitly passed. Pass an empty string to clear either field.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        final_url_suffix: Bare query string with no leading '?', e.g.
+            "utm_source=google&utm_medium=cpc&utm_campaign=konut-eylul".
+            ValueTrack parameters such as {keyword} and {adgroupid} are
+            allowed. Omit to keep; pass "" to clear.
+        tracking_url_template: Full redirect template, e.g.
+            "{lpurl}?utm_source=google". Omit to keep; pass "" to clear.
+
+    Returns:
+        What changed, and the campaign read back.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+
+    if final_url_suffix is None and tracking_url_template is None:
+        raise ValueError(
+            "Give final_url_suffix or tracking_url_template (or both)."
+        )
+
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign.final_url_suffix, campaign.tracking_url_template
+        FROM campaign WHERE campaign.id = {campaign_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No campaign {campaign_id} in account {customer_id}.")
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignService")
+    operation = client.get_type("CampaignOperation")
+    campaign = operation.update
+    campaign.resource_name = service.campaign_path(customer_id, campaign_id)
+
+    paths = []
+    if final_url_suffix is not None:
+        campaign.final_url_suffix = _validate_url_suffix(final_url_suffix)
+        paths.append("final_url_suffix")
+    if tracking_url_template is not None:
+        campaign.tracking_url_template = tracking_url_template.strip()
+        paths.append("tracking_url_template")
+
+    client.copy_from(
+        operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
+    )
+    service.mutate_campaigns(customer_id=customer_id, operations=[operation])
+
+    return {
+        "campaign_id": campaign_id,
+        "changed": paths,
+        "before": {
+            "final_url_suffix": current[0]["campaign"].get(
+                "final_url_suffix", ""
+            ),
+            "tracking_url_template": current[0]["campaign"].get(
+                "tracking_url_template", ""
+            ),
+        },
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign.id, campaign.name, campaign.final_url_suffix,
+                   campaign.tracking_url_template
+            FROM campaign WHERE campaign.id = {campaign_id}
+            """,
+        ),
+    }
+
+
+# --------------------------------------------------------------------------
 # Ad scheduling
 # --------------------------------------------------------------------------
 
@@ -565,6 +983,7 @@ def set_campaign_ad_schedule(
     campaign_id: str,
     schedule: List[Dict[str, Any]],
     replace_existing: bool = True,
+    confirm_spend: bool = False,
 ) -> Dict[str, Any]:
     """Sets when a campaign is allowed to serve, in the ACCOUNT'S time zone.
 
@@ -583,20 +1002,63 @@ def set_campaign_ad_schedule(
         campaign_id: The campaign to schedule.
         schedule: One dict per time block, e.g.
             [{"day": "MONDAY", "start_hour": 9, "end_hour": 23},
-             {"day": "TUESDAY", "start_hour": 9, "end_hour": 23}]
+             {"day": "TUESDAY", "start_hour": 9, "end_hour": 23,
+              "bid_modifier": 0.5}]
             Hours are 0-24. Minutes may be 0, 15, 30 or 45 via the optional
             "start_minute"/"end_minute" keys; end_hour 24 means midnight.
+            The optional "bid_modifier" multiplies the bid inside that block:
+            0.5 bids half, 1.5 bids fifty percent more. Allowed range is
+            0.1 to 10.0 -- there is no 0, because an hour is turned off by
+            being absent, not by a modifier. Use a modifier instead of
+            deleting a block when the hours still convert, only worse: a
+            deleted block earns nothing and therefore never proves itself
+            wrong, while a discounted one keeps producing the data the next
+            decision needs.
         replace_existing: True (default) clears the campaign's current ad
             schedule first, so the result is exactly what you passed. False
             adds to what is already there, which can only widen the hours.
+        confirm_spend: Required when the campaign is ENABLED and any block
+            carries a bid_modifier above 1.0, which raises cost per click
+            immediately.
 
     Returns:
         The campaign's full ad schedule, read back after the change.
     """
     customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("CampaignCriterionService")
     campaign_service = utils.get_googleads_service("CampaignService")
+
+    raised = [
+        float(e["bid_modifier"])
+        for e in schedule
+        if e.get("bid_modifier") is not None and float(e["bid_modifier"]) > 1.0
+    ]
+    if raised:
+        current = _read_back(
+            customer_id,
+            f"""
+            SELECT campaign.id, campaign.name, campaign.status,
+                   campaign_budget.amount_micros
+            FROM campaign WHERE campaign.id = {campaign_id}
+            """,
+        )
+        if not current:
+            raise ValueError(
+                f"No campaign {campaign_id} in account {customer_id}."
+            )
+        if _campaign_is_serving(current[0]) and not confirm_spend:
+            daily = _from_micros(
+                int(current[0]["campaign_budget"]["amount_micros"])
+            )
+            raise SpendConfirmationRequired(
+                f"'{current[0]['campaign']['name']}' is ENABLED and spending "
+                f"{daily}/day in the account's currency. A bid modifier above "
+                f"1.0 (highest here: {max(raised)}) raises cost per click "
+                f"inside those hours straight away. Show this to the user and "
+                f"call again with confirm_spend=True only after they agree."
+            )
 
     removed = []
     if replace_existing:
@@ -656,6 +1118,15 @@ def set_campaign_ad_schedule(
         criterion.ad_schedule.end_minute = getattr(
             minute_enum, minute_names[int(entry.get("end_minute", 0))]
         )
+        if entry.get("bid_modifier") is not None:
+            modifier = float(entry["bid_modifier"])
+            if not 0.1 <= modifier <= 10.0:
+                raise ValueError(
+                    f"bid_modifier must be between 0.1 and 10.0, not "
+                    f"{modifier} (for {day}). To stop serving in an hour, "
+                    f"leave that block out of the schedule instead."
+                )
+            criterion.bid_modifier = modifier
         operations.append(operation)
 
     service.mutate_campaign_criteria(
@@ -676,7 +1147,8 @@ def set_campaign_ad_schedule(
             SELECT campaign_criterion.criterion_id,
                    campaign_criterion.ad_schedule.day_of_week,
                    campaign_criterion.ad_schedule.start_hour,
-                   campaign_criterion.ad_schedule.end_hour
+                   campaign_criterion.ad_schedule.end_hour,
+                   campaign_criterion.bid_modifier
             FROM campaign_criterion
             WHERE campaign.id = {campaign_id}
               AND campaign_criterion.type = AD_SCHEDULE
@@ -849,6 +1321,9 @@ def update_bid_strategy(
     bidding_strategy: str,
     target_cpa: Optional[float] = None,
     target_roas: Optional[float] = None,
+    impression_share_location: Optional[str] = None,
+    impression_share_percent: Optional[float] = None,
+    cpc_bid_ceiling: Optional[float] = None,
     confirm_spend: bool = False,
 ) -> Dict[str, Any]:
     """Changes a campaign's bidding strategy.
@@ -865,9 +1340,19 @@ def update_bid_strategy(
         customer_id: The Google Ads account id.
         campaign_id: The campaign to change.
         bidding_strategy: MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS,
-            TARGET_CPA or TARGET_ROAS.
+            TARGET_CPA, TARGET_ROAS or TARGET_IMPRESSION_SHARE.
         target_cpa: Required for TARGET_CPA, in the account's own currency.
         target_roas: Required for TARGET_ROAS, as a ratio (4.0 means 400%).
+        impression_share_location: Required for TARGET_IMPRESSION_SHARE.
+            ANYWHERE_ON_PAGE, TOP_OF_PAGE or ABSOLUTE_TOP_OF_PAGE.
+        impression_share_percent: Required for TARGET_IMPRESSION_SHARE. The
+            share of auctions to appear in, as a percentage 1-100.
+        cpc_bid_ceiling: Maximum CPC, in the account's own currency.
+            REQUIRED for TARGET_IMPRESSION_SHARE, which bids for position
+            rather than for a conversion and will otherwise pay whatever the
+            auction asks -- the usual reason an own-brand campaign costs
+            several times what a brand click should. Optional for
+            MAXIMIZE_CLICKS; rejected by the conversion-based strategies.
         confirm_spend: Required when the campaign is ENABLED.
 
     Returns:
@@ -914,18 +1399,22 @@ def update_bid_strategy(
     # selects the strategy and clears any stale value on it.
     if strategy == "MANUAL_CPC":
         campaign.manual_cpc.enhanced_cpc_enabled = False
-        path = "manual_cpc.enhanced_cpc_enabled"
+        paths = ["manual_cpc.enhanced_cpc_enabled"]
     elif strategy == "MAXIMIZE_CLICKS":
         client.copy_from(
             campaign.target_spend, client.get_type("TargetSpend")
         )
-        path = "target_spend.cpc_bid_ceiling_micros"
+        if cpc_bid_ceiling is not None:
+            campaign.target_spend.cpc_bid_ceiling_micros = _to_micros(
+                cpc_bid_ceiling
+            )
+        paths = ["target_spend.cpc_bid_ceiling_micros"]
     elif strategy == "MAXIMIZE_CONVERSIONS":
         client.copy_from(
             campaign.maximize_conversions,
             client.get_type("MaximizeConversions"),
         )
-        path = "maximize_conversions.target_cpa_micros"
+        paths = ["maximize_conversions.target_cpa_micros"]
     elif strategy == "TARGET_CPA":
         if target_cpa is None:
             raise ValueError("TARGET_CPA requires target_cpa.")
@@ -935,18 +1424,69 @@ def update_bid_strategy(
         campaign.maximize_conversions.target_cpa_micros = _to_micros(
             target_cpa
         )
-        path = "maximize_conversions.target_cpa_micros"
+        paths = ["maximize_conversions.target_cpa_micros"]
     elif strategy == "TARGET_ROAS":
         if target_roas is None:
             raise ValueError("TARGET_ROAS requires target_roas.")
         # Likewise: Target ROAS is Maximize Conversion Value with a target.
         campaign.maximize_conversion_value.target_roas = target_roas
-        path = "maximize_conversion_value.target_roas"
+        paths = ["maximize_conversion_value.target_roas"]
+    elif strategy == "TARGET_IMPRESSION_SHARE":
+        if (
+            impression_share_location is None
+            or impression_share_percent is None
+            or cpc_bid_ceiling is None
+        ):
+            raise ValueError(
+                "TARGET_IMPRESSION_SHARE requires impression_share_location, "
+                "impression_share_percent and cpc_bid_ceiling. The ceiling is "
+                "required by Google, not by this tool: without it the "
+                "strategy pays whatever holding the position costs."
+            )
+        location = impression_share_location.upper()
+        if location not in _IMPRESSION_SHARE_LOCATIONS:
+            raise ValueError(
+                f"impression_share_location must be one of "
+                f"{sorted(_IMPRESSION_SHARE_LOCATIONS)}, not "
+                f"{impression_share_location!r}."
+            )
+        if not 1 <= impression_share_percent <= 100:
+            raise ValueError(
+                "impression_share_percent is a percentage and must be "
+                "between 1 and 100."
+            )
+        campaign.target_impression_share.location = getattr(
+            client.enums.TargetImpressionShareLocationEnum, location
+        )
+        # Google expresses this share in micros of a whole, so 100% is
+        # 1_000_000 and 1% is 10_000 -- not the money micros used elsewhere.
+        campaign.target_impression_share.location_fraction_micros = int(
+            round(impression_share_percent * 10_000)
+        )
+        campaign.target_impression_share.cpc_bid_ceiling_micros = _to_micros(
+            cpc_bid_ceiling
+        )
+        paths = [
+            "target_impression_share.location",
+            "target_impression_share.location_fraction_micros",
+            "target_impression_share.cpc_bid_ceiling_micros",
+        ]
     else:
         raise ValueError(f"Unknown bidding strategy: {bidding_strategy}")
 
+    if cpc_bid_ceiling is not None and strategy in (
+        "MANUAL_CPC",
+        "MAXIMIZE_CONVERSIONS",
+        "TARGET_CPA",
+        "TARGET_ROAS",
+    ):
+        raise ValueError(
+            f"{strategy} has no cpc_bid_ceiling. Only MAXIMIZE_CLICKS and "
+            f"TARGET_IMPRESSION_SHARE accept one."
+        )
+
     client.copy_from(
-        operation.update_mask, field_mask_pb2.FieldMask(paths=[path])
+        operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
     )
     service.mutate_campaigns(customer_id=customer_id, operations=[operation])
 
@@ -959,7 +1499,12 @@ def update_bid_strategy(
             customer_id,
             f"""
             SELECT campaign.id, campaign.name, campaign.status,
-                   campaign.bidding_strategy_type
+                   campaign.bidding_strategy_type,
+                   campaign.target_spend.cpc_bid_ceiling_micros,
+                   campaign.target_impression_share.location,
+                   campaign.target_impression_share.location_fraction_micros,
+                   campaign.target_impression_share.cpc_bid_ceiling_micros,
+                   campaign.maximize_conversions.target_cpa_micros
             FROM campaign WHERE campaign.id = {campaign_id}
             """,
         ),

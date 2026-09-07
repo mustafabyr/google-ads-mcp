@@ -30,7 +30,7 @@ yıl sonra yanlış bilgi kaynağıdır — bu dosya onu engellemek için var.
 | 6 | `CampaignConversionGoalService.mutate` `partial_failure` almaz; parti ya hep ya hiç | `KOD` | `google/ads/googleads/v25/services/types/campaign_conversion_goal_service.py` | 2026-09-03 |
 | 7 | GAQL alan yolu satır kesemez; `UNEXPECTED_INPUT` verir | `GÖZLEM` | İstek kimliği `4CpIiMqAg2OTS9RQKvcEzQ` | 2026-09-03 |
 | 8 | Çağrı uzantısı `USE_RESOURCE_LEVEL` + boş `call_conversion_action` durumunda arama hiçbir yere yazılmaz | `GÖZLEM` | Hesap 644-051-8752, asset 50888313754 | 2026-09-03 |
-| 9 | `positive_geo_target_type` varsayılanı `PRESENCE_OR_INTEREST` | `KONVANSİYON` | Google dokümanında doğrulanacak | — |
+| 9 | `positive_geo_target_type` varsayılanı `PRESENCE_OR_INTEREST` | `GÖZLEM` | `create_search_campaign` ile açılan 24214097685 ve 24219748067 kampanyaları bu değerle okundu (hesap 4935403315) | 2026-09-06 |
 | 10 | Google en az 4 site bağlantısı olmadan sitelink göstermiyor | `KONVANSİYON` | Yaygın kabul; doğrulanacak | — |
 | 11 | Akıllı teklif için 30 günde ~30 dönüşüm eşiği | `KONVANSİYON` | Google zaman içinde bu rehberliği değiştirdi; **müşteriye Google kuralı diye sunma** | — |
 | 12 | Öğrenme evresi 7-14 gün | `KONVANSİYON` | Kampanya tipine göre değişir; doğrulanacak | — |
@@ -38,6 +38,10 @@ yıl sonra yanlış bilgi kaynağıdır — bu dosya onu engellemek için var.
 | 14 | Aynı hesaptan iki kampanya aynı açık artırmaya girmez; tam eşleme öncelik kazanır | `KONVANSİYON` | Doğrulanacak | — |
 | 15 | Reklam gücü bir performans metriği değil, tamamlanmışlık göstergesi | `KONVANSİYON` | Google'ın kendi uyarısıyla örtüşür; doğrulanacak | — |
 | 16 | `metrics.conversions` yalnızca `include_in_conversions_metric` açık işlemleri sayar; `metrics.all_conversions` hepsini sayar | `GÖZLEM` | Hesap 644-051-8752, 7 gün: 0'a karşı 526 | 2026-09-04 |
+| 17 | `TargetImpressionShare.location_fraction_micros` bir bütünün micro'sudur: %1 = 10.000, %100 = 1.000.000 — paranın micro'su değil | `KOD` | `google/ads/googleads/v25/common/types/bidding.py`, `TargetImpressionShare` docstring: "For example, 1% equals 10,000." | 2026-09-06 |
+| 18 | `TargetImpressionShare.cpc_bid_ceiling_micros` zorunlu alandır | `KOD` | Aynı dosya: "This is a required field entered by the advertiser" | 2026-09-06 |
+| 19 | `campaign_criterion.bid_modifier` aralığı 0.1 – 10.0 | `KOD` | `google/ads/googleads/v25/resources/types/campaign_criterion.py`: "The modifier must be in the range: 0.1 - 10.0" | 2026-09-06 |
+| 20 | API ile açılan kampanyada dil ölçütü oluşmaz; dil ölçütü yoksa tüm diller hedeflenir | `GÖZLEM` | 24214097685 ve 24219748067'de `campaign_criterion.type = LANGUAGE` sorgusu boş döndü (hesap 4935403315) | 2026-09-06 |
 | 17 | `metrics.search_budget_lost_impression_share` yalnızca kampanya seviyesinde okunur | `GÖZLEM` | `AD_GROUP` FROM ile hata, istek kimliği `oFF0rp5nBD5zWK9W1s2MTg` | 2026-09-04 |
 | 18 | `AdGroupAd` durumu `REMOVED`'a güncellemeyle çekilemez, ayrı `remove` işlemi gerekir | `GÖZLEM` | `INVALID_ENUM_VALUE`, istek kimliği `OBW-MzDdbztl2HYKL-iB6g` | 2026-09-04 |
 | 19 | Paylaşılan negatif liste en fazla 5.000 terim tutar | `KONVANSİYON` | Google dokümanında doğrulanacak | — |

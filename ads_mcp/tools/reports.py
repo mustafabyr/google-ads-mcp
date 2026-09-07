@@ -593,7 +593,8 @@ def get_conversion_performance(
         customer_id,
         """
         SELECT conversion_action.resource_name, conversion_action.name,
-               conversion_action.type, conversion_action.status,
+               conversion_action.type, conversion_action.origin,
+               conversion_action.status,
                conversion_action.include_in_conversions_metric,
                conversion_action.primary_for_goal
         FROM conversion_action
@@ -602,6 +603,26 @@ def get_conversion_performance(
     ):
         action = row["conversion_action"]
         settings[action["resource_name"]] = action
+
+    # What actually reaches bidding is decided by the account's CONVERSION
+    # GOALS, keyed by (category, origin) -- not by the action's own
+    # include_in_conversions_metric. The two disagree in real accounts: an
+    # action with that flag false still counts when its goal is biddable.
+    # Reading the flag alone reports working measurement as broken.
+    goals: Dict[tuple, bool] = {}
+    for row in _rows(
+        customer_id,
+        """
+        SELECT customer_conversion_goal.category,
+               customer_conversion_goal.origin,
+               customer_conversion_goal.biddable
+        FROM customer_conversion_goal
+        """,
+    ):
+        goal = row["customer_conversion_goal"]
+        goals[(goal.get("category"), goal.get("origin"))] = bool(
+            goal.get("biddable")
+        )
 
     merged: Dict[str, Dict[str, Any]] = {}
     for row in rows:
@@ -628,21 +649,41 @@ def get_conversion_performance(
     actions = []
     for entry in merged.values():
         cfg = settings.get(entry["conversion_action"], {})
-        counts = bool(cfg.get("include_in_conversions_metric"))
-        actions.append(
-            {
-                "name": entry["name"],
-                "category": entry["category"],
-                "type": _enum(cfg, "type"),
-                "conversion_action_id": (entry["conversion_action"] or "")
-                .rsplit("/", 1)[-1] or None,
-                "all_conversions": round(entry["all_conversions"], 2),
-                "conversions": round(entry["conversions"], 2),
-                "value": round(entry["conversion_value"], 2),
-                "counts_towards_bidding": counts,
-                "primary_for_goal": bool(cfg.get("primary_for_goal")),
-            }
-        )
+        category = entry["category"] or cfg.get("category")
+        origin = _enum(cfg, "origin")
+        own_flag = bool(cfg.get("include_in_conversions_metric"))
+
+        # The goal is the authority; fall back to the action's own flag only
+        # when no goal covers this (category, origin) pair.
+        if (category, origin) in goals:
+            counts = goals[(category, origin)]
+            basis = "conversion goal"
+        else:
+            counts = own_flag
+            basis = "action flag (no goal found for this category/origin)"
+
+        record = {
+            "name": entry["name"],
+            "category": category,
+            "origin": origin,
+            "type": _enum(cfg, "type"),
+            "conversion_action_id": (entry["conversion_action"] or "")
+            .rsplit("/", 1)[-1] or None,
+            "all_conversions": round(entry["all_conversions"], 2),
+            "conversions": round(entry["conversions"], 2),
+            "value": round(entry["conversion_value"], 2),
+            "counts_towards_bidding": counts,
+            "decided_by": basis,
+            "include_in_conversions_metric": own_flag,
+            "primary_for_goal": bool(cfg.get("primary_for_goal")),
+        }
+        if counts != own_flag:
+            record["note"] = (
+                "The action's own include_in_conversions_metric says "
+                f"{own_flag}, but the account's conversion goal for "
+                f"{category}/{origin} decides otherwise. The goal wins."
+            )
+        actions.append(record)
     actions.sort(key=lambda a: a["all_conversions"], reverse=True)
 
     excluded = [a for a in actions if not a["counts_towards_bidding"]]
@@ -651,6 +692,9 @@ def get_conversion_performance(
 
     result = {
         "date_range": date_range,
+        "biddable_goals": sorted(
+            f"{cat}/{org}" for (cat, org), ok in goals.items() if ok
+        ),
         "actions": actions,
         "totals": {
             "all_conversions": total_all,

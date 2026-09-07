@@ -66,7 +66,7 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 
 | Module | Namespace | Contents |
 |---|---|---|
-| `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting (location ids + proximity radius), ad schedule, location lookup |
+| `campaigns.py` | `campaigns` | budgets, search campaigns, status, settings, bidding strategy, device bid modifiers, geo targeting (location ids + proximity radius + presence-vs-interest), language targeting, final URL suffix and tracking template, ad schedule with bid modifiers, location and language lookup |
 | `campaign_types.py` | `campaign_types` | Demand Gen and YouTube campaigns, YouTube video assets |
 | `pmax.py` | `pmax` | Performance Max campaigns, asset groups, image assets, signals |
 | `keyword_research.py` | `keyword_research` | search volume, competition, top-of-page bid ranges |
@@ -169,7 +169,26 @@ These cost a debugging session each. Check them in every new tool.
 - `campaign.geo_target_type_setting.positive_geo_target_type` defaults to
   PRESENCE_OR_INTEREST, which serves ads to people merely INTERESTED in the
   area from anywhere. For a local business it must be PRESENCE. This is the
-  commonest silent leak in an inherited local account.
+  commonest silent leak in an inherited local account, and it applies to
+  campaigns this server creates too -- `create_search_campaign` does not set
+  it, so fix it with `set_campaign_geo_target_type` right after creating.
+- A campaign created through the API carries NO language criterion, and no
+  language criterion means ALL languages. A Turkish campaign therefore serves
+  against English-language sessions until `set_campaign_languages` is called.
+  Neither a campaign report nor `list_campaign_targeting` makes the omission
+  look like a problem: the LANGUAGE section is simply absent.
+- `TargetImpressionShare.location_fraction_micros` is micros of a WHOLE, not
+  the money micros used everywhere else in this repo: 1% is 10,000 and 100%
+  is 1,000,000. Passing a percentage straight through as money micros asks
+  for a 0.008% impression share.
+- `TargetImpressionShare.cpc_bid_ceiling_micros` is REQUIRED, not optional --
+  the client library says so in the field's own docstring. Without a ceiling
+  the strategy pays whatever holding the position costs, which is how an
+  own-brand campaign ends up at several times a brand click's worth.
+- `campaign.final_url_suffix` must be a BARE query string: a leading `?` or
+  `&` is rejected. It is also per campaign, so a per-campaign `utm_campaign`
+  value cannot be set at account level -- and it is the only place to put UTM
+  parameters on an existing RSA, whose `final_url` is immutable.
 - A GAQL field path cannot wrap across lines. Splitting
   `customer.call_reporting_setting.call_conversion_reporting_enabled` after
   the second dot to fit 79 columns fails with `UNEXPECTED_INPUT: unexpected
