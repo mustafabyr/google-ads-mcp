@@ -590,27 +590,53 @@ def _check_auto_apply(cid: str, f: _Findings) -> None:
         LIMIT 500
         """,
     )
-    robotic = {}
+    robotic: Dict[tuple, Dict[str, Any]] = {}
     for row in rows:
         e = row["change_event"]
         client = _enum(e.get("client_type")) or ""
         if "RECOMMENDATIONS" not in client and "AUTOMATED" not in client:
             continue
         key = (client, _enum(e.get("change_resource_type")))
-        robotic[key] = robotic.get(key, 0) + 1
+        slot = robotic.setdefault(key, {"removals": 0, "last": ""})
+        slot["removals"] += 1
+        when = str(e.get("change_date_time") or "")[:10]
+        if when > slot["last"]:
+            slot["last"] = when
 
-    if robotic:
+    if not robotic:
+        return
+
+    # The window is 30 days, so a setting switched off three weeks ago still
+    # shows its old damage here. Saying "Google IS deleting things" when the
+    # user already turned it off is the tool being wrong, loudly. Date the
+    # last automated change and let it decide how alarmed to be.
+    latest = max(v["last"] for v in robotic.values())
+    days_quiet = (today - datetime.date.fromisoformat(latest)).days if latest else 0
+    evidence = [
+        {"client": k[0], "resource": k[1], "removals": v["removals"], "last_change": v["last"]}
+        for k, v in sorted(robotic.items(), key=lambda kv: -kv[1]["removals"])
+    ]
+
+    if days_quiet <= 7:
         f.add(
             CRITICAL,
             "governance",
-            "Google is deleting things in this account automatically.",
+            f"Google is changing this account automatically -- last on {latest}.",
             "Turn off Recommendations auto-apply in the UI (it cannot be "
             "read or changed through the API). Auto-apply removing negative "
             "keywords hands your budget back to the traffic you excluded.",
-            evidence=[
-                {"client": k[0], "resource": k[1], "removals_30d": v}
-                for k, v in sorted(robotic.items(), key=lambda kv: -kv[1])
-            ],
+            evidence=evidence,
+        )
+    else:
+        f.add(
+            NOTE,
+            "governance",
+            f"Automated changes in the window, but none since {latest} "
+            f"({days_quiet} days ago).",
+            "Consistent with auto-apply having been turned off. Worth "
+            "checking what it removed while it was on -- deleted negatives "
+            "do not come back on their own.",
+            evidence=evidence,
         )
 
 
