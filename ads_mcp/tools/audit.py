@@ -213,30 +213,60 @@ def _check_conversions(cid: str, f: _Findings) -> Dict[str, Any]:
             g.get("biddable")
         )
 
+    # Metrics cannot be selected FROM conversion_action -- the API rejects it
+    # ("metric is incompatible with the resource in the FROM clause"). The
+    # numbers come from campaign segmented by conversion action; the settings
+    # come from the conversion_action resource with no metrics. Two queries,
+    # joined here.
+    settings: Dict[str, Dict[str, Any]] = {}
+    for row in _rows(
+        cid,
+        """
+        SELECT conversion_action.resource_name, conversion_action.name,
+               conversion_action.category, conversion_action.origin,
+               conversion_action.include_in_conversions_metric
+        FROM conversion_action
+        WHERE conversion_action.status != 'REMOVED'
+        """,
+    ):
+        a = row["conversion_action"]
+        settings[a["resource_name"]] = a
+
     rows = _rows(
         cid,
         """
-        SELECT conversion_action.name, conversion_action.category,
-               conversion_action.origin, conversion_action.status,
-               conversion_action.include_in_conversions_metric,
-               metrics.all_conversions, metrics.conversions
-        FROM conversion_action
+        SELECT segments.conversion_action, segments.conversion_action_name,
+               metrics.conversions, metrics.all_conversions
+        FROM campaign
         WHERE segments.date DURING LAST_30_DAYS
+          AND metrics.all_conversions > 0
         """,
     )
 
+    totals: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        seg = row.get("segments", {})
+        m = row.get("metrics", {})
+        key = seg.get("conversion_action")
+        entry = totals.setdefault(
+            key,
+            {"name": seg.get("conversion_action_name"), "conversions": 0.0, "all": 0.0},
+        )
+        entry["conversions"] += float(m.get("conversions") or 0)
+        entry["all"] += float(m.get("all_conversions") or 0)
+
     counted = 0.0
     stranded: List[Dict[str, Any]] = []
-    for row in rows:
-        a = row["conversion_action"]
-        m = row.get("metrics", {})
-        all_conv = float(m.get("all_conversions") or 0)
+    for resource, entry in totals.items():
+        a = settings.get(resource, {})
         key = (_enum(a.get("category")), _enum(a.get("origin")))
         biddable = goals.get(key, bool(a.get("include_in_conversions_metric")))
         if biddable:
-            counted += float(m.get("conversions") or 0)
-        elif all_conv > 0:
-            stranded.append({"name": a.get("name"), "all_conversions": round(all_conv, 1)})
+            counted += entry["conversions"]
+        elif entry["all"] > 0:
+            stranded.append(
+                {"name": entry["name"] or a.get("name"), "all_conversions": round(entry["all"], 1)}
+            )
 
     if counted == 0 and stranded:
         f.add(
@@ -845,14 +875,17 @@ def run_portfolio_audit(
             unreachable.append({"customer_id": cid, "name": name, "error": str(exc)[:200]})
             continue
 
-        accounts.append(
-            {
-                "customer_id": cid,
-                "name": name,
-                "counts": audit["counts"],
-                "verdict": audit["verdict"],
-            }
-        )
+        entry = {
+            "customer_id": cid,
+            "name": name,
+            "counts": audit["counts"],
+            "verdict": audit["verdict"],
+        }
+        # A silently dropped check is worse than a failed one: it makes a
+        # broken audit look clean. Carry it up.
+        if audit.get("checks_failed"):
+            entry["checks_failed"] = audit["checks_failed"]
+        accounts.append(entry)
         for finding in audit["findings"]:
             key = (finding["severity"], finding["area"], finding["fix"])
             slot = grouped.setdefault(

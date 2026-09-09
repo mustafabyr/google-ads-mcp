@@ -46,6 +46,10 @@ yıl sonra yanlış bilgi kaynağıdır — bu dosya onu engellemek için var.
 | 18 | `AdGroupAd` durumu `REMOVED`'a güncellemeyle çekilemez, ayrı `remove` işlemi gerekir | `GÖZLEM` | `INVALID_ENUM_VALUE`, istek kimliği `OBW-MzDdbztl2HYKL-iB6g` | 2026-09-04 |
 | 19 | Paylaşılan negatif liste en fazla 5.000 terim tutar | `KONVANSİYON` | Google dokümanında doğrulanacak | — |
 | 20 | Arama ağında yeniden pazarlama listesi için ~1.000 aktif üye eşiği | `KONVANSİYON` | Araç bunu varsaymaz; `user_list.eligible_for_search` bayrağını okur | — |
+| 22 | `targeting_setting` güncelleme maskesinde yaprak değildir; `FIELD_HAS_SUBFIELDS` hatası verir, `targeting_setting.target_restrictions` kullanılmalı | `GÖZLEM` | `add_audience_to_campaign` çağrısı hata verdi, istek kimliği `Kg-Q9EexhNQI7uNEZrJfLQ` (hesap 4935403315, kampanya 24214097685) | 2026-09-09 |
+| 23 | Kitle ölçütleri yazıldıktan sonra kampanya ayarı güncellemesi patlarsa ölçütler hesapta yarım kalır — işlem atomik değildir | `GÖZLEM` | Aynı çağrıda 2 `USER_LIST` ölçütü oluştu, kampanya güncellemesi hata verdi; ölçütler elle geri alındı | 2026-09-09 |
+| 24 | Aynı cinsiyet/yaş/konum ölçütü ikinci kez oluşturulamaz; teklif ayarı ilk seferde create, sonrasında update olmalı | `KONVANSİYON` | `CRITERION_ALREADY_EXISTS`; araç mevcut ölçütleri önce okuyup dallanıyor | — |
+| 25 | Aramada çoğu kullanıcının yaşı/cinsiyeti bilinmez; `UNDETERMINED` kovaları genellikle en büyük kovadır | `KONVANSİYON` | Hesap verisiyle doğrulanacak; araç bu yüzden hariç tutma yerine teklif ayarını öneriyor | — |
 | 21 | Deney trafik bölmesi 1-99 arası olmalı | `KONVANSİYON` | Test hesabında doğrulanacak | — |
 | 22 | Yüklenen çevrimdışı dönüşüm raporlarda 3 saate kadar gecikebilir | `KONVANSİYON` | Google dokümanında doğrulanacak | — |
 | 23 | Günlük bütçe aylık tavan değildir; Google iyi bir günde günlüğün 2 katına kadar harcayabilir | `KONVANSİYON` | Google dokümanında doğrulanacak | — |
@@ -60,6 +64,7 @@ yıl sonra yanlış bilgi kaynağıdır — bu dosya onu engellemek için var.
 | 32 | `change_event` sorgusu hem alt hem üst tarih sınırı ve `LIMIT` ister; tek sınırla hata döner | `DOKÜMAN` | https://developers.google.com/google-ads/api/docs/change-event | 2026-09-07 |
 | 33 | Öneriler otomatik uygulama API'den ne okunabilir ne kapatılabilir; tek kanıt `change_event.client_type` alanındaki robot istemcilerdir | `GÖZLEM` | Hesap 644-051-8752'de bir ayda 5 negatif kelime silinmesi | 2026-09-07 |
 | 34 | Dönüşümün teklife girip girmediğine eylemin `include_in_conversions_metric` alanı değil, hesabın (kategori, köken) anahtarlı dönüşüm hedefi karar verir | `GÖZLEM` | Hesap 493-540-3315: WhatsApp eylemi bayrak false, 1791 dönüşüm sayıldı; hesap toplamı 1931 = 1791 + 140 | 2026-09-07 |
+| 35 | `metrics.*` alanları `FROM conversion_action` ile seçilemez; dönüşüm işlemi bazlı metrik `FROM campaign` + `segments.conversion_action` ile alınır | `GÖZLEM` | Hesap 644-051-8752, istek kimliği `h64MJ-y4SacXlx8KIE94Iw`: "metric is incompatible with the resource in the FROM clause" | 2026-09-09 |
 
 ## Kural
 

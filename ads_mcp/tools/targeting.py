@@ -397,9 +397,13 @@ def add_audience_to_campaign(
     )
     restriction.bid_only = mode == "OBSERVATION"
     campaign.targeting_setting.target_restrictions.append(restriction)
+    # The mask must name a LEAF: "targeting_setting" is a message with
+    # subfields and the API rejects it with FIELD_HAS_SUBFIELDS.
     client.copy_from(
         campaign_operation.update_mask,
-        field_mask_pb2.FieldMask(paths=["targeting_setting"]),
+        field_mask_pb2.FieldMask(
+            paths=["targeting_setting.target_restrictions"]
+        ),
     )
     campaign_service.mutate_campaigns(
         customer_id=customer_id, operations=[campaign_operation]

@@ -1817,3 +1817,347 @@ def set_campaign_proximity(
             """,
         ),
     }
+
+
+_AGE_RANGES = {
+    "AGE_RANGE_18_24",
+    "AGE_RANGE_25_34",
+    "AGE_RANGE_35_44",
+    "AGE_RANGE_45_54",
+    "AGE_RANGE_55_64",
+    "AGE_RANGE_65_UP",
+    "AGE_RANGE_UNDETERMINED",
+}
+
+_GENDERS = {"MALE", "FEMALE", "UNDETERMINED"}
+
+
+def _check_modifier(name: str, value: float) -> float:
+    value = float(value)
+    if not 0.1 <= value <= 10.0:
+        raise ValueError(
+            f"Bid modifier for {name} is {value}; Google accepts 0.1 to 10.0. "
+            f"1.0 means no change, 1.2 bids 20% more, 0.8 bids 20% less."
+        )
+    return value
+
+
+def _existing_criteria(
+    customer_id: str, campaign_id: str, criterion_type: str, key_field: str
+) -> Dict[str, Dict[str, Any]]:
+    """Maps an enum value to the criterion already on the campaign.
+
+    Demographic and location criteria cannot be created twice: a second
+    create for the same age range, gender or location is rejected with
+    CRITERION_ALREADY_EXISTS. So a bid modifier is a create the first time
+    and an update every time after, and the caller cannot know which.
+    """
+    rows = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign_criterion.criterion_id,
+               campaign_criterion.resource_name,
+               campaign_criterion.negative,
+               campaign_criterion.bid_modifier,
+               campaign_criterion.{key_field}
+        FROM campaign_criterion
+        WHERE campaign.id = {campaign_id}
+          AND campaign_criterion.type = {criterion_type}
+          AND campaign_criterion.status != 'REMOVED'
+        """,
+    )
+    found: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        criterion = row.get("campaign_criterion", {})
+        node = criterion
+        for part in key_field.split("."):
+            node = (node or {}).get(part) if isinstance(node, dict) else None
+        if node:
+            found[str(node)] = criterion
+    return found
+
+
+def _spend_gate(
+    customer_id: str,
+    campaign_id: str,
+    raised: List[float],
+    what: str,
+    confirm_spend: bool,
+) -> Dict[str, Any]:
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign_budget.amount_micros
+        FROM campaign WHERE campaign.id = {campaign_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No campaign {campaign_id} in account {customer_id}.")
+    if raised and _campaign_is_serving(current[0]) and not confirm_spend:
+        daily = _from_micros(
+            int(current[0]["campaign_budget"]["amount_micros"])
+        )
+        raise SpendConfirmationRequired(
+            f"'{current[0]['campaign']['name']}' is ENABLED and spending "
+            f"{daily}/day in the account's currency. A {what} bid modifier "
+            f"above 1.0 (highest here: {max(raised)}) raises cost per click "
+            f"for those people straight away. Show this to the user and call "
+            f"again with confirm_spend=True only after they agree."
+        )
+    return current[0]
+
+
+@campaigns_mcp.tool
+def set_demographic_bid_modifiers(
+    customer_id: str,
+    campaign_id: str,
+    genders: Optional[Dict[str, float]] = None,
+    age_ranges: Optional[Dict[str, float]] = None,
+    confirm_spend: bool = False,
+) -> Dict[str, Any]:
+    """Bids more or less for an age range or gender, without excluding it.
+
+    This is the tool to reach for when data says a group converts better --
+    not exclude_demographics. A modifier keeps everyone eligible and only
+    shifts what you pay; an exclusion throws the group away, and on Search
+    that is usually a mistake because Google does not know most searchers'
+    age or gender at all. Those unknowns land in AGE_RANGE_UNDETERMINED and
+    UNDETERMINED, which are typically the largest buckets on the campaign,
+    so bidding them down is bidding down most of your traffic.
+
+    A modifier is a create the first time and an update afterwards; this
+    tool works out which and does not fail on a second call.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        genders: Maps MALE, FEMALE or UNDETERMINED to a modifier, 0.1-10.0.
+            1.2 bids 20% more, 0.8 bids 20% less, 1.0 is no change.
+        age_ranges: Maps AGE_RANGE_18_24, AGE_RANGE_25_34, AGE_RANGE_35_44,
+            AGE_RANGE_45_54, AGE_RANGE_55_64, AGE_RANGE_65_UP or
+            AGE_RANGE_UNDETERMINED to a modifier, 0.1-10.0.
+        confirm_spend: Required when the campaign is ENABLED and any modifier
+            is above 1.0.
+
+    Returns:
+        What was created, what was updated, and the criteria read back.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+    genders = {str(k).upper(): v for k, v in (genders or {}).items()}
+    age_ranges = {str(k).upper(): v for k, v in (age_ranges or {}).items()}
+    if not genders and not age_ranges:
+        raise ValueError("Give genders, age_ranges, or both.")
+    for value in genders:
+        if value not in _GENDERS:
+            raise ValueError(
+                f"{value!r} is not a gender. Use one of {sorted(_GENDERS)}."
+            )
+    for value in age_ranges:
+        if value not in _AGE_RANGES:
+            raise ValueError(
+                f"{value!r} is not an age range. Use one of "
+                f"{sorted(_AGE_RANGES)}."
+            )
+    genders = {k: _check_modifier(k, v) for k, v in genders.items()}
+    age_ranges = {k: _check_modifier(k, v) for k, v in age_ranges.items()}
+
+    raised = [v for v in list(genders.values()) + list(age_ranges.values())
+              if v > 1.0]
+    _spend_gate(customer_id, campaign_id, raised, "demographic", confirm_spend)
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignCriterionService")
+    campaign_path = utils.get_googleads_service(
+        "CampaignService"
+    ).campaign_path(customer_id, campaign_id)
+
+    existing_gender = _existing_criteria(
+        customer_id, campaign_id, "GENDER", "gender.type"
+    )
+    existing_age = _existing_criteria(
+        customer_id, campaign_id, "AGE_RANGE", "age_range.type"
+    )
+
+    operations: List[Any] = []
+    created: List[str] = []
+    updated: List[str] = []
+    skipped: List[str] = []
+
+    def _plan(value: str, modifier: float, existing: Dict[str, Any], kind: str):
+        row = existing.get(value)
+        operation = client.get_type("CampaignCriterionOperation")
+        if row is not None:
+            if row.get("negative"):
+                # An exclusion cannot also carry a bid modifier; changing it
+                # here would silently widen reach.
+                skipped.append(f"{value} (excluded; remove the exclusion first)")
+                return
+            criterion = operation.update
+            criterion.resource_name = row["resource_name"]
+            criterion.bid_modifier = modifier
+            client.copy_from(
+                operation.update_mask,
+                field_mask_pb2.FieldMask(paths=["bid_modifier"]),
+            )
+            updated.append(value)
+        else:
+            criterion = operation.create
+            criterion.campaign = campaign_path
+            criterion.bid_modifier = modifier
+            if kind == "GENDER":
+                criterion.gender.type_ = getattr(
+                    client.enums.GenderTypeEnum, value
+                )
+            else:
+                criterion.age_range.type_ = getattr(
+                    client.enums.AgeRangeTypeEnum, value
+                )
+            created.append(value)
+        operations.append(operation)
+
+    for value, modifier in genders.items():
+        _plan(value, modifier, existing_gender, "GENDER")
+    for value, modifier in age_ranges.items():
+        _plan(value, modifier, existing_age, "AGE_RANGE")
+
+    if operations:
+        service.mutate_campaign_criteria(
+            customer_id=customer_id, operations=operations
+        )
+
+    result = {
+        "campaign_id": campaign_id,
+        "created": created,
+        "updated": updated,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.type,
+                   campaign_criterion.negative,
+                   campaign_criterion.bid_modifier,
+                   campaign_criterion.gender.type,
+                   campaign_criterion.age_range.type
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type IN (GENDER, AGE_RANGE)
+              AND campaign_criterion.status != 'REMOVED'
+            """,
+        ),
+    }
+    if skipped:
+        result["skipped"] = skipped
+    return result
+
+
+@campaigns_mcp.tool
+def set_location_bid_modifiers(
+    customer_id: str,
+    campaign_id: str,
+    location_bids: Dict[str, float],
+    confirm_spend: bool = False,
+) -> Dict[str, Any]:
+    """Bids more or less inside named locations within what is already targeted.
+
+    Use this to lean towards the places that actually buy without cutting the
+    rest loose. Adding a district that sits inside an already-targeted city
+    does not widen reach -- the city already covered it -- it only makes that
+    district biddable on its own.
+
+    Get the ids from find_location_ids first; never guess one. A location
+    already on the campaign is updated rather than created, so calling this
+    twice is safe.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        location_bids: Maps geo target constant ids to modifiers, 0.1-10.0.
+            For example {"9198902": 1.25} bids 25% more in that district.
+        confirm_spend: Required when the campaign is ENABLED and any modifier
+            is above 1.0.
+
+    Returns:
+        What was created, what was updated, and the criteria read back.
+    """
+    customer_id = _clean_id(customer_id)
+    campaign_id = _clean_id(campaign_id)
+    location_bids = {
+        _clean_id(str(k)): _check_modifier(str(k), v)
+        for k, v in (location_bids or {}).items()
+    }
+    if not location_bids:
+        raise ValueError("Give at least one location id and a modifier.")
+
+    raised = [v for v in location_bids.values() if v > 1.0]
+    _spend_gate(customer_id, campaign_id, raised, "location", confirm_spend)
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CampaignCriterionService")
+    campaign_path = utils.get_googleads_service(
+        "CampaignService"
+    ).campaign_path(customer_id, campaign_id)
+
+    existing = _existing_criteria(
+        customer_id, campaign_id, "LOCATION", "location.geo_target_constant"
+    )
+
+    operations: List[Any] = []
+    created: List[str] = []
+    updated: List[str] = []
+    skipped: List[str] = []
+
+    for location_id, modifier in location_bids.items():
+        row = existing.get(f"geoTargetConstants/{location_id}")
+        operation = client.get_type("CampaignCriterionOperation")
+        if row is not None:
+            if row.get("negative"):
+                skipped.append(
+                    f"{location_id} (excluded; remove the exclusion first)"
+                )
+                continue
+            criterion = operation.update
+            criterion.resource_name = row["resource_name"]
+            criterion.bid_modifier = modifier
+            client.copy_from(
+                operation.update_mask,
+                field_mask_pb2.FieldMask(paths=["bid_modifier"]),
+            )
+            updated.append(location_id)
+        else:
+            criterion = operation.create
+            criterion.campaign = campaign_path
+            criterion.bid_modifier = modifier
+            criterion.location.geo_target_constant = (
+                f"geoTargetConstants/{location_id}"
+            )
+            created.append(location_id)
+        operations.append(operation)
+
+    if operations:
+        service.mutate_campaign_criteria(
+            customer_id=customer_id, operations=operations
+        )
+
+    result = {
+        "campaign_id": campaign_id,
+        "created": created,
+        "updated": updated,
+        "verified": _read_back(
+            customer_id,
+            f"""
+            SELECT campaign_criterion.criterion_id,
+                   campaign_criterion.negative,
+                   campaign_criterion.bid_modifier,
+                   campaign_criterion.location.geo_target_constant
+            FROM campaign_criterion
+            WHERE campaign.id = {campaign_id}
+              AND campaign_criterion.type = LOCATION
+              AND campaign_criterion.status != 'REMOVED'
+            """,
+        ),
+    }
+    if skipped:
+        result["skipped"] = skipped
+    return result
