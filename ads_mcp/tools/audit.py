@@ -448,7 +448,11 @@ def _check_ads(cid: str, f: _Findings) -> None:
         elif approval in ("APPROVED_LIMITED", "AREA_OF_INTEREST_ONLY"):
             limited.append({"where": where, "status": approval, "topics": topics})
 
-        if _enum(ad.get("ad_strength")) in ("POOR", "PENDING"):
+        # PENDING is not a verdict -- it is what every ad reads while Google
+        # reviews it, which is exactly what an ad you just edited or created
+        # looks like. Counting it as POOR made a restructure report itself as
+        # 17 weak ads the moment the work was done.
+        if _enum(ad.get("ad_strength")) == "POOR":
             poor.append(where)
 
     if disapproved:
