@@ -169,6 +169,21 @@ def _flatten_extension(row: Dict[str, Any]) -> Dict[str, Any]:
     urls = asset.get("final_urls") or []
     if urls:
         out["final_urls"] = urls
+
+    # The broken state a call extension can sit in: it says "count calls
+    # against my own conversion action" and names none, so the button
+    # shows, people call, and the call is counted nowhere.
+    if field_type == "CALL":
+        state = str(content.get("call_conversion_reporting_state") or "")
+        if state == "USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION" and not (
+            content.get("call_conversion_action")
+        ):
+            out["warning"] = (
+                "call_conversion_action is EMPTY while the reporting state "
+                "is USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION: calls from "
+                "this button are counted nowhere. Repoint it with "
+                "update_call_extension(use_account_default=True)."
+            )
     return out
 
 
@@ -629,8 +644,12 @@ def add_call_extension(
         )
         removals = []
         for row in existing:
+            # The rows come from _flatten_extension, which puts the link's
+            # resource name under this flat key -- not under a nested
+            # "campaign_asset" dict. Reading the nested key raised KeyError
+            # on every replace_existing=True call.
             removal = client.get_type("CampaignAssetOperation")
-            removal.remove = row["campaign_asset"]["resource_name"]
+            removal.remove = row["campaign_asset_resource_name"]
             removals.append(removal)
         if removals:
             campaign_asset_service.mutate_campaign_assets(

@@ -88,14 +88,14 @@ class TestRendering(unittest.TestCase):
         self.assertEqual(S.resource_for("upload_click_conversions"), "click_conversion")
         self.assertEqual(S.resource_for("schedule_experiment"), "experiment")
 
-    def test_placeholders_are_negative_and_keep_the_parent(self):
+    def test_placeholders_are_sentinels_and_keep_the_parent(self):
         self.assertEqual(
             S.placeholder_name(CID, "campaign_budget", {}, 1),
-            f"customers/{CID}/campaignBudgets/-1",
+            f"customers/{CID}/campaignBudgets/9990000000000001",
         )
         self.assertEqual(
             S.placeholder_name(CID, "ad_group_ad", {"ad_group": f"customers/{CID}/adGroups/77"}, 2),
-            f"customers/{CID}/adGroupAds/77~-2",
+            f"customers/{CID}/adGroupAds/77~9990000000000002",
         )
 
     def test_compare_reads_ignores_metrics_and_order(self):
@@ -124,13 +124,13 @@ class TestPlanMode(unittest.TestCase):
                 response = service.mutate_campaign_budgets(
                     customer_id=CID, operations=[_budget_update(), _budget_create()]
                 )
-                after = _read(CID, "SELECT campaign_budget.id FROM campaign_budget WHERE campaign_budget.id = -1")
+                after = _read(CID, "SELECT campaign_budget.id FROM campaign_budget WHERE campaign_budget.id = 9990000000000001")
         self.assertEqual(fake.calls, [])  # no write reached the fake
         self.assertEqual(len(session.reads), 1)  # the read after the write is not a "before"
         self.assertEqual(session.reads[0].rows[0]["campaign_budget"]["amount_micros"], "5000000")
         self.assertTrue(session.wrote)
         self.assertEqual(response.results[0].resource_name, f"customers/{CID}/campaignBudgets/55")
-        self.assertEqual(response.results[1].resource_name, f"customers/{CID}/campaignBudgets/-1")
+        self.assertEqual(response.results[1].resource_name, f"customers/{CID}/campaignBudgets/9990000000000001")
         write = session.writes[0]
         self.assertEqual(write.method, "mutate_campaign_budgets")
         self.assertEqual(write.operations[0]["resource"], "campaign_budget")
@@ -210,7 +210,7 @@ class TestApplyMode(unittest.TestCase):
         self.assertTrue(call["validate_only"])
         self.assertEqual(call["customer_id"], CID)
         self.assertEqual(len(call["operations"]), 1)
-        self.assertEqual(response.results[0].resource_name, f"customers/{CID}/campaignBudgets/-1")
+        self.assertEqual(response.results[0].resource_name, f"customers/{CID}/campaignBudgets/9990000000000001")
         self.assertTrue(session.writes[0].validate_only)
 
     def test_direct_mode_records_reads_before_the_first_write_only(self):

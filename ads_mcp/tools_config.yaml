@@ -21,3 +21,4 @@ namespaces:
   experiments: true
   audit: true
   plans: true
+  negatives: true

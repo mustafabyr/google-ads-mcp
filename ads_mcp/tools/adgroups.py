@@ -49,6 +49,10 @@ _MAX_DESCRIPTIONS = 4
 
 _MATCH_TYPES = {"EXACT", "PHRASE", "BROAD"}
 
+# Negative keywords are sent in batches of this many; a long list in one
+# request was refused in the field (docs/kaynaklar.md).
+_NEGATIVE_BATCH_SIZE = 10
+
 
 def _clean_id(value: str) -> str:
     cleaned = "".join(ch for ch in str(value) if ch.isdigit())
@@ -531,9 +535,11 @@ def add_negative_keywords(
                 client.enums.KeywordMatchTypeEnum, match_type
             )
             operations.append(operation)
-        service.mutate_campaign_criteria(
-            customer_id=customer_id, operations=operations
-        )
+        for start in range(0, len(operations), _NEGATIVE_BATCH_SIZE):
+            service.mutate_campaign_criteria(
+                customer_id=customer_id,
+                operations=operations[start : start + _NEGATIVE_BATCH_SIZE],
+            )
         scope, scope_id = "campaign", campaign_id
     else:
         ad_group_id = _clean_id(ad_group_id)
@@ -551,15 +557,18 @@ def add_negative_keywords(
                 client.enums.KeywordMatchTypeEnum, match_type
             )
             operations.append(operation)
-        service.mutate_ad_group_criteria(
-            customer_id=customer_id, operations=operations
-        )
+        for start in range(0, len(operations), _NEGATIVE_BATCH_SIZE):
+            service.mutate_ad_group_criteria(
+                customer_id=customer_id,
+                operations=operations[start : start + _NEGATIVE_BATCH_SIZE],
+            )
         scope, scope_id = "ad_group", ad_group_id
 
     return {
         "scope": scope,
         "scope_id": scope_id,
         "added": len(operations),
+        "batches": -(-len(operations) // _NEGATIVE_BATCH_SIZE),
         "match_type": match_type,
     }
 

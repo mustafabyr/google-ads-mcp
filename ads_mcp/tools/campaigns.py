@@ -534,6 +534,159 @@ def enable_campaign(
 
 
 # --------------------------------------------------------------------------
+# Call-focused campaigns
+#
+# Google Ads API v25 has no call ad: the Ad message carries no `call_ad`
+# field and the client library has no CallAdInfo (docs/kaynaklar.md).
+# What the API can build is the shape Google migrated call ads into -- a
+# Search campaign whose responsive search ads carry a call asset -- and
+# that is what this tool builds, in one step and in the right order.
+# --------------------------------------------------------------------------
+
+
+@campaigns_mcp.tool
+def create_call_campaign(
+    customer_id: str,
+    name: str,
+    phone_number: str,
+    final_url: str,
+    headlines: List[str],
+    descriptions: List[str],
+    budget_resource_name: Optional[str] = None,
+    daily_budget: Optional[float] = None,
+    country_code: str = "TR",
+    call_conversion_action_id: Optional[str] = None,
+    ad_group_name: Optional[str] = None,
+    bidding_strategy: str = "MAXIMIZE_CLICKS",
+    cpc_bid: Optional[float] = None,
+    keywords: Optional[List[Dict[str, Any]]] = None,
+    path1: Optional[str] = None,
+    path2: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Builds a campaign whose ads exist to make the phone ring.
+
+    Call-only ads are gone from the Google Ads API (v25 has no call ad
+    type), so a "call campaign" is built the way Google now builds one: a
+    Search campaign, one ad group, a responsive search ad, and a CALL asset
+    on the campaign so every ad shows the call button and every call is
+    counted as a conversion. This tool does those steps in order, so the
+    result is one campaign rather than four half-finished objects.
+
+    The campaign is created PAUSED and spends nothing until enable_campaign.
+    Keywords are optional here so the copy can be reviewed first; add_keywords
+    fills the ad group afterwards.
+
+    Args:
+        customer_id: The Google Ads account id.
+        name: Campaign name, unique in the account.
+        phone_number: The business number as a local caller would dial it.
+        final_url: Landing page for the ad, with https://. Copy it from an
+            approved ad or confirm it resolves; never type it from memory.
+        headlines: 3-15 headlines, at most 30 characters each. Put the
+            call to action in them ("Hemen Arayın").
+        descriptions: 2-4 descriptions, at most 90 characters each.
+        budget_resource_name: An existing budget, e.g.
+            "customers/123/campaignBudgets/456". Give this OR daily_budget.
+        daily_budget: Creates a new budget with this daily amount in the
+            account's own currency. Give this OR budget_resource_name.
+        country_code: Two-letter country of the number, e.g. "TR".
+        call_conversion_action_id: Count calls against this conversion
+            action. Omit to use the account's default call action.
+        ad_group_name: Defaults to the campaign name.
+        bidding_strategy: MANUAL_CPC, MAXIMIZE_CLICKS (default) or
+            MAXIMIZE_CONVERSIONS. Conversion-based bidding needs a call
+            conversion action that actually records.
+        cpc_bid: Max CPC for the ad group, in the account's currency. Used
+            by MANUAL_CPC only.
+        keywords: Optional, same shape as add_keywords:
+            [{"text": "acil çilingir", "match_type": "PHRASE"}].
+        path1: Optional display path, at most 15 characters.
+        path2: Optional second display path.
+
+    Returns:
+        The ids of everything created, the campaign read back PAUSED, and
+        the account's call reporting state -- which must be on for the
+        calls to be measured.
+    """
+    # Lazy imports: adgroups and extensions import this module.
+    from ads_mcp.tools import adgroups, extensions
+
+    customer_id = _clean_id(customer_id)
+    if bool(budget_resource_name) == bool(daily_budget):
+        raise ValueError("Give exactly one of budget_resource_name or daily_budget.")
+    strategy = bidding_strategy.upper()
+    if strategy not in {"MANUAL_CPC", "MAXIMIZE_CLICKS", "MAXIMIZE_CONVERSIONS"}:
+        raise ValueError(
+            "bidding_strategy must be MANUAL_CPC, MAXIMIZE_CLICKS or "
+            "MAXIMIZE_CONVERSIONS."
+        )
+    if not final_url.startswith(("http://", "https://")):
+        raise ValueError("final_url must start with http:// or https://")
+
+    budget = None
+    if daily_budget is not None:
+        budget = create_campaign_budget(
+            customer_id, f"{name} - bütçe", daily_budget
+        )
+        budget_resource_name = budget["resource_name"]
+
+    campaign = create_search_campaign(
+        customer_id,
+        name,
+        budget_resource_name,
+        bidding_strategy=strategy,
+        search_network=False,
+        content_network=False,
+    )
+    campaign_id = campaign["campaign_id"]
+
+    ad_group = adgroups.create_ad_group(
+        customer_id, campaign_id, ad_group_name or name, cpc_bid=cpc_bid
+    )
+    ad = adgroups.create_responsive_search_ad(
+        customer_id,
+        ad_group["ad_group_id"],
+        final_url,
+        headlines,
+        descriptions,
+        path1=path1,
+        path2=path2,
+    )
+    call = extensions.add_call_extension(
+        customer_id,
+        campaign_id,
+        phone_number,
+        country_code=country_code,
+        call_conversion_action_id=call_conversion_action_id,
+    )
+    added_keywords = None
+    if keywords:
+        added_keywords = adgroups.add_keywords(
+            customer_id, ad_group["ad_group_id"], keywords
+        )
+
+    return {
+        "campaign_id": campaign_id,
+        "budget_resource_name": budget_resource_name,
+        "budget_created": budget["budget_id"] if budget else None,
+        "ad_group_id": ad_group["ad_group_id"],
+        "ad_id": ad["ad_id"],
+        "call_asset_resource_name": call.get("asset_resource_name"),
+        "keywords_added": added_keywords["added"] if added_keywords else 0,
+        "status": "PAUSED",
+        "call_reporting_setting": call.get("call_reporting_setting"),
+        "warnings": call.get("warnings", []),
+        "note": (
+            "Created PAUSED. The API has no call-only ad type any more; this "
+            "is a Search campaign with a call asset, which is what Google "
+            "migrated call ads into. Set geo targeting and languages, add "
+            "keywords if none were given, then enable_campaign."
+        ),
+        "verified": campaign.get("verified"),
+    }
+
+
+# --------------------------------------------------------------------------
 # Geo targeting
 # --------------------------------------------------------------------------
 

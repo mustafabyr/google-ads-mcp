@@ -250,20 +250,33 @@ def render_message(message: Any) -> Dict[str, Any]:
     return {"value": _shrink(message)}
 
 
+# Placeholder ids start with this; the rest is a counter. Sixteen digits is
+# a valid int64 and far above any id Google has issued, so a tool's
+# read-back after a captured create matches nothing instead of failing --
+# and, unlike a negative id, the placeholder survives the tools' own
+# digits-only id cleaning, so a tool that builds on an earlier create
+# (campaign -> ad group -> ad) still addresses the right placeholder.
+PLACEHOLDER_PREFIX = "999000000"
+
+
+def placeholder_id(n: int) -> str:
+    return f"{PLACEHOLDER_PREFIX}{n:07d}"
+
+
+def is_placeholder(value: Any) -> bool:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits.startswith(PLACEHOLDER_PREFIX) and len(digits) == 16
+
+
 def placeholder_name(
     customer_id: str, resource: str, fields: Dict[str, Any], n: int
 ) -> str:
-    """A resource name for an object that does not exist yet.
-
-    Negative ids are Google's own convention for temporary resources, and
-    GAQL accepts them in a WHERE clause and matches nothing, so a tool's
-    read-back after a captured create returns no rows instead of failing.
-    """
+    """A resource name for an object that does not exist yet."""
     collection, parent = _COLLECTIONS.get(resource, (resource + "s", None))
     if parent and fields.get(parent):
         parent_id = str(fields[parent]).rsplit("/", 1)[-1]
-        return f"customers/{customer_id}/{collection}/{parent_id}~-{n}"
-    return f"customers/{customer_id}/{collection}/-{n}"
+        return f"customers/{customer_id}/{collection}/{parent_id}~{placeholder_id(n)}"
+    return f"customers/{customer_id}/{collection}/{placeholder_id(n)}"
 
 
 def _strip_volatile(row: Dict[str, Any]) -> Dict[str, Any]:

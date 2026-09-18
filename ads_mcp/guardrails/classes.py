@@ -93,6 +93,7 @@ TOOL_CLASSES: Dict[str, str] = {
     "campaigns.set_campaign_proximity": SPEND,
     "campaigns.set_demographic_bid_modifiers": SPEND,
     "campaigns.set_location_bid_modifiers": SPEND,
+    "campaigns.create_call_campaign": SPEND,
     # --- adgroups -----------------------------------------------------------
     "adgroups.create_ad_group": SPEND,
     "adgroups.set_ad_group_status": SPEND,
@@ -166,6 +167,9 @@ TOOL_CLASSES: Dict[str, str] = {
     "shared_sets.attach_negative_keyword_list": PROTECTIVE,
     "shared_sets.detach_negative_keyword_list": DESTRUCTIVE,
     "shared_sets.remove_negative_keyword_list": DESTRUCTIVE,
+    "shared_sets.remove_terms": DESTRUCTIVE,
+    # --- negatives (pure functions, no API) ---------------------------------
+    "negatives.expand_turkish": READ,
     # --- targeting ----------------------------------------------------------
     "targeting.list_campaign_targeting": READ,
     "targeting.list_audiences": READ,

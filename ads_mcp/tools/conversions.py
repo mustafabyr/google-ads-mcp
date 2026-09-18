@@ -471,8 +471,13 @@ def update_conversion_action(
 
     Because that switch decides what smart bidding chases, changing it (or
     `primary_for_goal`, or the value) while a conversion-based strategy is
-    serving requires confirm_spend=True. Renaming is always free, and
-    status=REMOVED is not reversible so it requires confirm_remove=True.
+    serving requires confirm_spend=True. Renaming is always free.
+
+    STATUS CANNOT BE CHANGED HERE. Google's enum has no PAUSED for a
+    conversion action, and the API refuses HIDDEN and REMOVED on an update.
+    A conversion action is retired only in the Google Ads interface
+    (Goals > Conversions > the action > Remove). Passing `status` returns
+    that explanation instead of an opaque API error.
 
     This does NOT work on GOOGLE_HOSTED actions -- the local actions that
     come from the Business Profile, such as "click to call" and "directions".
@@ -493,10 +498,12 @@ def update_conversion_action(
         click_lookback_days: How many days after a click a conversion still
             counts, 1-90.
         name: New name for the action.
-        status: ENABLED, PAUSED or REMOVED.
+        status: Not supported -- see above. Any value is refused with the
+            reason; the parameter stays so older callers get a clear
+            message rather than a schema error.
         confirm_spend: Required when a change would alter what a serving
             conversion-based campaign bids toward.
-        confirm_remove: Required for status=REMOVED.
+        confirm_remove: Kept for compatibility; no longer used.
 
     Returns:
         The action's real post-write state, read back from the API.
@@ -519,22 +526,24 @@ def update_conversion_action(
         and status is None
         and click_lookback_days is None
     ):
-        raise ValueError("Nothing to change: pass at least one field.")
+        raise ValueError(
+            "Nothing to change: pass at least one field. (Status cannot "
+            "be changed through the API; see the tool description.)"
+        )
 
     if click_lookback_days is not None and not 1 <= click_lookback_days <= 90:
         raise ValueError("click_lookback_days must be between 1 and 90.")
 
     if status is not None:
-        status = status.upper()
-        if status not in {"ENABLED", "PAUSED", "REMOVED"}:
-            raise ValueError("status must be ENABLED, PAUSED or REMOVED.")
-        if status == "REMOVED" and not confirm_remove:
-            raise ValueError(
-                "Removing a conversion action is not reversible: its history "
-                "stops being usable and any bidding strategy pointed at it "
-                "loses that signal. Say so, then call again with "
-                "confirm_remove=True."
-            )
+        raise ValueError(
+            f"A conversion action's status cannot be changed through the "
+            f"API: Google's enum has no PAUSED, and HIDDEN and REMOVED are "
+            f"refused on an update (requested: {str(status).upper()!r}). "
+            f"Retire it in the Google Ads interface instead: Goals > "
+            f"Conversions > the action > Remove. To stop it feeding bidding "
+            f"without retiring it, set include_in_conversions_metric=False "
+            f"or primary_for_goal=False here."
+        )
 
     before = _read_back(
         customer_id,
@@ -620,11 +629,6 @@ def update_conversion_action(
     if name is not None:
         action.name = name
         paths.append("name")
-    if status is not None:
-        action.status = getattr(
-            client.enums.ConversionActionStatusEnum, status
-        )
-        paths.append("status")
 
     client.copy_from(
         operation.update_mask, field_mask_pb2.FieldMask(paths=paths)

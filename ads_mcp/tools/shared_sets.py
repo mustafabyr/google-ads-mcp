@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 import proto
 from fastmcp import FastMCP
+from google.ads.googleads.errors import GoogleAdsException
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
@@ -40,6 +41,12 @@ _MATCH_TYPES = {"EXACT", "PHRASE", "BROAD"}
 
 # Google's own cap on a single shared set.
 _MAX_MEMBERS = 5000
+
+# Terms are sent in batches of this many. A single request carrying more
+# than about a dozen shared criteria was refused in the field (see
+# docs/kaynaklar.md), so a long list is split here and the batch results
+# are merged, instead of asking the caller to split it.
+_BATCH_SIZE = 10
 
 
 def _clean_id(value: str) -> str:
@@ -73,6 +80,10 @@ def _read_back(customer_id: str, query: str) -> List[Dict[str, Any]]:
                 proto.Message.to_dict(row, use_integers_for_enums=False)
             )
     return rows
+
+
+def _batches(items: List[Any], size: int = _BATCH_SIZE) -> List[List[Any]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 def _sets(customer_id: str, shared_set_id: Optional[str] = None) -> List[Dict]:
@@ -318,18 +329,47 @@ def _add_terms(
         )
         operations.append(operation)
 
-    if operations:
-        service.mutate_shared_criteria(
-            customer_id=customer_id, operations=operations
-        )
+    # Sent in batches of _BATCH_SIZE. A batch that Google refuses is
+    # reported and the rest still go, so one bad term does not lose the
+    # other thirty-seven.
+    added = 0
+    batches_sent = 0
+    failed: List[Dict[str, Any]] = []
+    for index, batch in enumerate(_batches(operations), start=1):
+        try:
+            service.mutate_shared_criteria(
+                customer_id=customer_id, operations=batch
+            )
+        except GoogleAdsException as exc:
+            failed.append(
+                {
+                    "batch": index,
+                    "terms": [op.create.keyword.text for op in batch],
+                    "error": "; ".join(
+                        error.message for error in exc.failure.errors
+                    ) or "refused by the API",
+                }
+            )
+            continue
+        added += len(batch)
+        batches_sent += 1
 
-    return {
+    result = {
         "shared_set_id": shared_set_id,
-        "added": len(operations),
+        "added": added,
+        "batches": batches_sent,
+        "batch_size": _BATCH_SIZE,
         "already_present": skipped,
         "match_type": match_type,
         "verified": _sets(customer_id, shared_set_id),
     }
+    if failed:
+        result["failed_batches"] = failed
+        result["note"] = (
+            f"{len(failed)} batch(es) were refused; their terms are listed "
+            f"in failed_batches and are NOT in the list."
+        )
+    return result
 
 
 @shared_sets_mcp.tool
@@ -357,6 +397,138 @@ def add_to_negative_keyword_list(
         How many were added, and which were already there.
     """
     return _add_terms(customer_id, shared_set_id, keywords, match_type)
+
+
+@shared_sets_mcp.tool
+def remove_terms(
+    customer_id: str,
+    shared_set_id: str,
+    keywords: Optional[List[str]] = None,
+    criterion_ids: Optional[List[str]] = None,
+    match_type: Optional[str] = None,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Removes individual terms from a shared negative keyword list.
+
+    Before this existed, fixing one wrong term meant rebuilding the whole
+    list. Now a term is removed by its text (any match type, or one given
+    match type) or by its criterion id from get_negative_keyword_list_terms.
+
+    Removing a negative REOPENS the searches it was blocking on every
+    campaign the list is attached to, which is a spend increase, so this is
+    a removal and needs confirmation. Terms that are not in the list are
+    reported, not treated as an error.
+
+    Args:
+        customer_id: The Google Ads account id.
+        shared_set_id: The list, from list_negative_keyword_lists.
+        keywords: Term texts to remove. Matching ignores case.
+        criterion_ids: Criterion ids to remove, as an alternative.
+        match_type: EXACT, PHRASE or BROAD to remove only that match type
+            of the given texts. Omit to remove every match type.
+        confirm_remove: Must be True. Say which searches will match again.
+
+    Returns:
+        What was removed, what was not found, and the list read back.
+    """
+    customer_id = _clean_id(customer_id)
+    shared_set_id = _clean_id(shared_set_id)
+    wanted_texts = {
+        str(k).strip().casefold() for k in (keywords or []) if str(k).strip()
+    }
+    wanted_ids = {_clean_id(c) for c in (criterion_ids or [])}
+    if not wanted_texts and not wanted_ids:
+        raise ValueError("Give keywords, criterion_ids, or both.")
+    if match_type is not None:
+        match_type = str(match_type).upper()
+        if match_type not in _MATCH_TYPES:
+            raise ValueError(
+                f"match_type must be one of {sorted(_MATCH_TYPES)}."
+            )
+
+    details = _sets(customer_id, shared_set_id)
+    if not details:
+        raise ValueError(
+            f"No shared set {shared_set_id} in account {customer_id}."
+        )
+
+    rows = _read_back(
+        customer_id,
+        f"""
+        SELECT shared_criterion.criterion_id,
+               shared_criterion.resource_name,
+               shared_criterion.keyword.text,
+               shared_criterion.keyword.match_type
+        FROM shared_criterion
+        WHERE shared_set.id = {shared_set_id}
+        """,
+    )
+    targets = []
+    for row in rows:
+        criterion = row["shared_criterion"]
+        text = str(criterion["keyword"]["text"])
+        kind = str(criterion["keyword"]["match_type"])
+        by_id = str(criterion["criterion_id"]) in wanted_ids
+        by_text = text.casefold() in wanted_texts and (
+            match_type is None or kind == match_type
+        )
+        if by_id or by_text:
+            targets.append(
+                {
+                    "criterion_id": str(criterion["criterion_id"]),
+                    "text": text,
+                    "match_type": kind,
+                    "resource_name": criterion["resource_name"],
+                }
+            )
+
+    found_texts = {t["text"].casefold() for t in targets}
+    found_ids = {t["criterion_id"] for t in targets}
+    not_found = sorted(wanted_texts - found_texts) + sorted(
+        wanted_ids - found_ids
+    )
+    if not targets:
+        return {
+            "shared_set_id": shared_set_id,
+            "removed": [],
+            "not_found": not_found,
+            "note": "None of those terms are in the list; nothing changed.",
+            "verified": details,
+        }
+    if not confirm_remove:
+        attached = details[0]["campaigns_using_it"]
+        raise ValueError(
+            f"Removing {len(targets)} term(s) from '{details[0]['name']}' "
+            f"lets those searches match again on {attached} campaign(s): "
+            f"{[t['text'] for t in targets][:20]}. Say so, then call again "
+            f"with confirm_remove=True."
+        )
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("SharedCriterionService")
+    operations = []
+    for target in targets:
+        operation = client.get_type("SharedCriterionOperation")
+        operation.remove = target["resource_name"]
+        operations.append(operation)
+    for batch in _batches(operations):
+        service.mutate_shared_criteria(
+            customer_id=customer_id, operations=batch
+        )
+
+    return {
+        "shared_set_id": shared_set_id,
+        "removed": [
+            {k: v for k, v in t.items() if k != "resource_name"}
+            for t in targets
+        ],
+        "not_found": not_found,
+        "note": (
+            "These searches can match again on every campaign the list is "
+            "attached to."
+        ),
+        "verified": _sets(customer_id, shared_set_id),
+    }
 
 
 @shared_sets_mcp.tool

@@ -84,6 +84,12 @@ def account_portfolio_overview(
         customer_ids: An explicit list of accounts, instead of discovering
             them.
 
+    Each account row also carries `call_extension_clicks` (clicks on the
+    call button in the date range), `phone_calls` (calls Google timed
+    through a forwarding number) and `spending_last_7_days`, whatever the
+    date range, because a client whose account has gone quiet is the first
+    thing to notice.
+
     Returns:
         `accounts` sorted by spend, `needs_attention`, and `unreachable`.
     """
@@ -147,7 +153,51 @@ def account_portfolio_overview(
             conversions = round(float(m.get("conversions") or 0), 2)
             all_conversions = round(float(m.get("all_conversions") or 0), 2)
 
+            # Clicks on the call button, i.e. the call extension. The
+            # segment has to be SELECTed to be filtered on; the customer
+            # resource does not carry metrics.phone_calls, so that one is
+            # summed from campaigns.
+            call_rows = _rows(
+                customer_id,
+                f"""
+                SELECT metrics.clicks, segments.click_type
+                FROM customer
+                WHERE segments.click_type = 'CALLS'
+                  AND segments.date DURING {date_range}
+                """,
+            )
+            call_clicks = sum(
+                int(r.get("metrics", {}).get("clicks") or 0) for r in call_rows
+            )
+            phone_calls = sum(
+                int(r.get("metrics", {}).get("phone_calls") or 0)
+                for r in _rows(
+                    customer_id,
+                    f"""
+                    SELECT campaign.id, metrics.phone_calls
+                    FROM campaign
+                    WHERE segments.date DURING {date_range}
+                    """,
+                )
+            )
+
+            # "Is it spending at all" is the first thing to know about an
+            # account, whatever date range the caller asked for.
+            week = _rows(
+                customer_id,
+                """
+                SELECT metrics.cost_micros
+                FROM customer
+                WHERE segments.date DURING LAST_7_DAYS
+                """,
+            )
+            cost_7d = _from_micros(
+                week[0].get("metrics", {}).get("cost_micros") if week else 0
+            )
+
             flags = []
+            if not cost_7d:
+                flags.append("no spend in the last 7 days")
             if all_conversions and not conversions:
                 flags.append(
                     "records conversions but none count towards bidding"
@@ -165,6 +215,10 @@ def account_portfolio_overview(
                     "test_account": bool(c.get("test_account")),
                     "cost": cost,
                     "clicks": int(m.get("clicks") or 0),
+                    "call_extension_clicks": call_clicks,
+                    "phone_calls": phone_calls,
+                    "cost_last_7_days": cost_7d,
+                    "spending_last_7_days": bool(cost_7d),
                     "conversions_counted": conversions,
                     "all_conversions": all_conversions,
                     "cost_per_conversion": round(cost / conversions, 2)

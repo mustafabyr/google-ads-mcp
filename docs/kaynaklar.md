@@ -65,6 +65,12 @@ yıl sonra yanlış bilgi kaynağıdır — bu dosya onu engellemek için var.
 | 33 | Öneriler otomatik uygulama API'den ne okunabilir ne kapatılabilir; tek kanıt `change_event.client_type` alanındaki robot istemcilerdir | `GÖZLEM` | Hesap 644-051-8752'de bir ayda 5 negatif kelime silinmesi | 2026-09-07 |
 | 34 | Dönüşümün teklife girip girmediğine eylemin `include_in_conversions_metric` alanı değil, hesabın (kategori, köken) anahtarlı dönüşüm hedefi karar verir | `GÖZLEM` | Hesap 493-540-3315: WhatsApp eylemi bayrak false, 1791 dönüşüm sayıldı; hesap toplamı 1931 = 1791 + 140 | 2026-09-07 |
 | 35 | `metrics.*` alanları `FROM conversion_action` ile seçilemez; dönüşüm işlemi bazlı metrik `FROM campaign` + `segments.conversion_action` ile alınır | `GÖZLEM` | Hesap 644-051-8752, istek kimliği `h64MJ-y4SacXlx8KIE94Iw`: "metric is incompatible with the resource in the FROM clause" | 2026-09-09 |
+| 36 | Paylaşılan negatif listeye tek istekte ~12'den fazla terim gönderilince istek reddediliyor; araç 10'luk partilere bölüyor | `GÖZLEM` | Sahada gözlendi (Faz 3 brifi, İP-5.2); istek kimliği kaydedilmedi — bir sonraki reddi kimliğiyle buraya yaz | 2026-09-18 |
+| 37 | Google Ads API v25'te yalnızca-arama (call-only) reklam tipi yok: `Ad` mesajında `call_ad` alanı, kütüphanede `CallAdInfo` bulunmuyor; karşılığı arama kampanyası + RSA + CALL varlığı | `KOD` | `google/ads/googleads/v25/resources/types/ad.py` alan listesi; `client.get_type("CallAdInfo")` → "does not exist in Google Ads API v25" | 2026-09-18 |
+| 38 | Dönüşüm eylemi durumu enum'unda `PAUSED` yok (`ENABLED`, `REMOVED`, `HIDDEN`); güncellemeyle `HIDDEN`/`REMOVED` reddediliyor, eylem yalnız panelden kaldırılır | `KOD` + `GÖZLEM` | `ConversionActionStatusEnum` (v25); sahada `HIDDEN`/`REMOVED` reddi (Faz 3 brifi, İP-5.5) | 2026-09-18 |
+| 39 | `segments.click_type` ile filtrelenen sorguda alanın SELECT'te de olması zorunlu | `GÖZLEM` | İstek kimliği `hvpndczlKRL7nP1HcJvNrg`: "The following field must be present in SELECT clause: 'segments.click_type'" | 2026-09-18 |
+| 40 | `metrics.phone_calls` / `metrics.phone_impressions` `FROM customer` ile seçilemez; kampanya düzeyinden toplanır | `GÖZLEM` | "could not support requested resources: 'CUSTOMER'" (üretim hesabı, 2026-09-18) | 2026-09-18 |
+| 41 | Plan modunda yer tutucu kimlik (`9990000000000001` gibi 16 haneli) ve negatif kimlik GAQL'de kabul edilir ve 0 satır döner | `GÖZLEM` | `campaign.id = -1` ve `campaign.id = 99999999999999` sorguları üretim hesabında 0 satırla döndü | 2026-09-18 |
 
 ## Kural
 
