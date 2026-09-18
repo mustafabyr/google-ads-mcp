@@ -1,0 +1,26 @@
+# Per-account ceilings for the Google Ads MCP server.
+#
+# Copy this file to ~/.google-ads-mcp/limits.yaml (or point
+# GOOGLE_ADS_MCP_LIMITS_PATH at it) and put the REAL numbers in. The real
+# file is private and gitignored; this one is only the shape.
+#
+# The contract: an account with no row here cannot be written to by any
+# SPEND or DESTRUCTIVE tool. READ and PROTECTIVE tools (reports, negatives,
+# pausing, lowering) work without a row.
+#
+# Amounts are in the ACCOUNT'S OWN currency. Nothing converts currencies.
+
+defaults:
+  max_budget_change_pct: 20              # one change may raise a budget by at most this much
+  min_days_between_budget_changes: 7     # and only this often, per budget
+
+accounts:
+  "1234567890":                          # dashes are fine: "123-456-7890"
+    name: Example client                 # optional, for humans
+    max_daily_budget_try: 4500           # highest daily budget any budget may be set to
+    max_cpc_ceiling_try: 20              # highest max-CPC bid or bid ceiling
+    allow_enable: true                   # may campaigns be enabled at all
+  "2345678901":
+    { max_daily_budget_try: 1500, max_cpc_ceiling_try: 45, allow_enable: true }
+  "3456789012":
+    { max_daily_budget_try: 800, max_cpc_ceiling_try: 15, allow_enable: false }

@@ -15,19 +15,32 @@
 """The function that stands in front of every tool.
 
 ``wrap`` returns a callable with the same signature as the tool; what it
-does around the call depends on the tool's class. In this revision it
-records the class on the function and passes the call through; the
-plan/apply and audit behaviour is layered on in the session module.
+does around the call depends on the tool's class:
+
+  READ         passes straight through.
+  PROTECTIVE   passes through; nothing here can raise spend.
+  SPEND,
+  DESTRUCTIVE  first checks that the account has a row in the limits file
+               and refuses if it does not -- "no ceiling, no write".
 """
 
 import functools
+import inspect
 from typing import Any, Callable, Dict
 
-from ads_mcp.guardrails import classes
+from ads_mcp.guardrails import classes, limits
 
 # Every guarded function carries these so tests and the plan executor can
 # find their way back to the bare tool.
 ORIGINALS: Dict[str, Callable[..., Any]] = {}
+
+
+def bound_kwargs(
+    fn: Callable[..., Any], args: tuple, kwargs: Dict[str, Any]
+) -> Dict[str, Any]:
+    """The call's arguments as one dict, however they were passed."""
+    bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+    return dict(bound.arguments)
 
 
 def wrap(
@@ -41,6 +54,14 @@ def wrap(
 
     @functools.wraps(fn)
     def guarded(*args: Any, **kwargs: Any) -> Any:
+        if cls in classes.PLANNED_CLASSES:
+            call = bound_kwargs(fn, args, kwargs)
+            customer_id = call.get("customer_id")
+            if not customer_id:
+                raise ValueError(
+                    f"{key} is a {cls} tool and needs customer_id."
+                )
+            limits.require_account(customer_id, tool=key)
         return fn(*args, **kwargs)
 
     guarded.__guardrail_class__ = cls  # type: ignore[attr-defined]
