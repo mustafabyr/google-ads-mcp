@@ -121,7 +121,7 @@ class TestRegistry(unittest.TestCase):
         from ads_mcp.guardrails import guard
 
         for key, cls in classes.TOOL_CLASSES.items():
-            if cls not in classes.PLANNED_CLASSES:
+            if cls not in classes.PLANNED_CLASSES or key in classes.EXECUTORS:
                 continue
             params = inspect.signature(guard.ORIGINALS[key]).parameters
             self.assertIn("customer_id", params, key)

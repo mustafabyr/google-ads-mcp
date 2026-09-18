@@ -20,3 +20,4 @@ namespaces:
   agency: true
   experiments: true
   audit: true
+  plans: true

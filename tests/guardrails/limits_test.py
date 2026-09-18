@@ -261,6 +261,7 @@ class TestGuardGate(LimitsFileCase):
         self.assertEqual(calls, [])
 
     def test_spend_tool_runs_with_a_row(self):
+        # A SPEND tool that turns out to write nothing answers directly.
         self.write()
         fn, calls = self._guarded(classes.SPEND)
         self.assertEqual(fn(ACCOUNT, 5)["ok"], True)

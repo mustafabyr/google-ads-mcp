@@ -190,7 +190,19 @@ TOOL_CLASSES: Dict[str, str] = {
     # --- audit --------------------------------------------------------------
     "audit.run_account_audit": READ,
     "audit.run_portfolio_audit": READ,
+    # --- plans --------------------------------------------------------------
+    # apply_plan executes whatever the plan holds, so the client sees the
+    # worst case. It gates itself (see EXECUTORS).
+    "plans.apply_plan": DESTRUCTIVE,
+    "plans.get_plan": READ,
+    "plans.list_plans": READ,
+    "plans.discard_plan": PROTECTIVE,
 }
+
+# Tools that execute plans rather than produce them. They carry a class for
+# the annotations but the guard does not wrap them in a plan session --
+# plans.apply does its own gating (expiry, once-only, confirm_destructive).
+EXECUTORS: FrozenSet[str] = frozenset({"plans.apply_plan"})
 
 # SPEND tools whose effective class is decided per call by the direction of
 # the change: a decrease takes the PROTECTIVE path, an increase the SPEND

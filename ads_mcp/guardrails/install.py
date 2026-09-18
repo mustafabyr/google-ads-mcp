@@ -60,6 +60,12 @@ def apply_guardrails(sub_mcp: FastMCP, namespace: str) -> Dict[str, str]:
     applied: Dict[str, str] = {}
     for tool in registered_tools(sub_mcp):
         cls = classes.tool_class(namespace, tool.name)
+        if getattr(tool.fn, "__guardrail_class__", None) == cls:
+            # Already guarded: the sub-servers are module globals, and a
+            # test that mounts them into a second parent must not stack a
+            # second guard on top of the first.
+            applied[classes.qualified_name(namespace, tool.name)] = cls
+            continue
         guarded = guard.wrap(
             tool.fn, namespace=namespace, tool_name=tool.name, cls=cls
         )

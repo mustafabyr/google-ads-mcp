@@ -133,6 +133,9 @@ class Change:
     resource_name: str
     fields: Dict[str, Any] = dataclasses.field(default_factory=dict)
     before: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Other sections of the same row, e.g. a campaign change carries its
+    # budget's amount under "campaign_budget.amount_micros".
+    context: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 def clean_id(value: Any) -> str:
