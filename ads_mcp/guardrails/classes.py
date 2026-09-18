@@ -190,6 +190,9 @@ TOOL_CLASSES: Dict[str, str] = {
     # --- audit --------------------------------------------------------------
     "audit.run_account_audit": READ,
     "audit.run_portfolio_audit": READ,
+    "audit.get_change_log": READ,
+    # Writes a line to the local decision log, nothing to the account.
+    "audit.log_manual_change": PROTECTIVE,
     # --- plans --------------------------------------------------------------
     # apply_plan executes whatever the plan holds, so the client sees the
     # worst case. It gates itself (see EXECUTORS).

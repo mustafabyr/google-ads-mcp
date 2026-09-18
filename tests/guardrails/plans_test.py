@@ -25,7 +25,7 @@ from unittest.mock import patch
 from google.protobuf import field_mask_pb2
 
 import ads_mcp.utils as utils
-from ads_mcp.guardrails import classes, guard, plans
+from ads_mcp.guardrails import audit_log, classes, guard, plans
 from ads_mcp.guardrails.session import ReadRecord
 from tests.fakes import FakeAds, offline_client, row
 
@@ -58,6 +58,7 @@ class PlanCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.env = patch.dict(os.environ, {
             plans.PLAN_DIR_ENV: str(pathlib.Path(self.tmp.name) / "plans"),
+            audit_log.AUDIT_DIR_ENV: str(pathlib.Path(self.tmp.name) / "audit"),
             guard.REQUIRE_DRY_RUN_ENV: "",
         })
         self.env.start()

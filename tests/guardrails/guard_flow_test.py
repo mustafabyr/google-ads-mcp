@@ -21,7 +21,7 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
-from ads_mcp.guardrails import classes, guard, limits, plans
+from ads_mcp.guardrails import audit_log, classes, guard, limits, plans
 from ads_mcp.guardrails.install import registered_tools
 from ads_mcp.guardrails.session import PlanPreconditionFailed
 from tests.fakes import FakeAds, row
@@ -73,6 +73,7 @@ class FlowCase(unittest.TestCase):
         self.env = patch.dict(os.environ, {
             limits.LIMITS_PATH_ENV: str(root / "limits.yaml"),
             plans.PLAN_DIR_ENV: str(root / "plans"),
+            audit_log.AUDIT_DIR_ENV: str(root / "audit"),
             guard.REQUIRE_DRY_RUN_ENV: "",
         })
         self.env.start()

@@ -943,3 +943,111 @@ def run_portfolio_audit(
         "shared_findings": shared,
         "unreachable": unreachable,
     }
+
+
+# --------------------------------------------------------------------------
+# The change log this server writes
+#
+# Google's change_event says what changed in the account. The audit log
+# says what THIS server changed, why (the plan), and who asked. Reading it
+# is how a briefing or a QA pass separates "we did this on purpose" from
+# "somebody did this in the interface".
+# --------------------------------------------------------------------------
+
+
+@audit_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_change_log(
+    customer_id: str,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    tool: Optional[str] = None,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """Reads what this server wrote to an account, newest first.
+
+    One entry per write attempt: applied writes, validations, refusals at
+    the precondition, API failures, and decisions logged by hand with
+    log_manual_change. Each carries the time in UTC and in Europe/Istanbul,
+    the tool and its class, the plan id, the operations sent and who asked.
+
+    Args:
+        customer_id: The Google Ads account id.
+        since: Start of the window, "YYYY-MM-DD" or an ISO timestamp.
+            Defaults to 30 days ago.
+        until: End of the window. Defaults to now.
+        tool: Limit to one tool, e.g. "campaigns.update_campaign_budget".
+        limit: Maximum entries, newest first.
+
+    Returns:
+        `entries`, the window, and counts by result and by tool.
+    """
+    from ads_mcp.guardrails import audit_log
+
+    entries = [
+        audit_log.summarize(e)
+        for e in audit_log.read(
+            _clean_id(customer_id), since=since, until=until, tool=tool,
+            limit=limit,
+        )
+    ]
+    by_result: Dict[str, int] = {}
+    by_tool: Dict[str, int] = {}
+    for entry in entries:
+        by_result[entry["result"] or "unknown"] = (
+            by_result.get(entry["result"] or "unknown", 0) + 1
+        )
+        by_tool[entry["tool"] or "unknown"] = (
+            by_tool.get(entry["tool"] or "unknown", 0) + 1
+        )
+    return {
+        "customer_id": _clean_id(customer_id),
+        "since": since or "30 days ago",
+        "until": until or "now",
+        "log_directory": str(audit_log.audit_dir()),
+        "entries": entries,
+        "by_result": by_result,
+        "by_tool": by_tool,
+    }
+
+
+@audit_mcp.tool
+def log_manual_change(
+    customer_id: str,
+    description: str,
+    resource_type: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    when: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Writes down a change made in the Google Ads interface, and why.
+
+    The audit checks compare Google's change history with this log: a
+    change made in the interface with no entry here is reported as an
+    undocumented change. Logging it closes that gap. Nothing in the account
+    is touched.
+
+    Args:
+        customer_id: The Google Ads account id.
+        description: What was changed and why, in one or two sentences.
+        resource_type: What kind of thing, as Google names it in the change
+            history: CAMPAIGN, AD_GROUP, AD_GROUP_CRITERION, CAMPAIGN_BUDGET,
+            CAMPAIGN_CRITERION, AD_GROUP_AD, ASSET ...
+        campaign_id: The campaign it concerns, if one.
+        when: When it was done, "YYYY-MM-DD" or an ISO timestamp. Defaults
+            to now.
+
+    Returns:
+        The entry as written, with both timestamps.
+    """
+    from ads_mcp.guardrails import audit_log, guard
+
+    description = str(description or "").strip()
+    if not description:
+        raise ValueError("Say what was changed and why.")
+    return audit_log.record_manual(
+        _clean_id(customer_id),
+        description,
+        resource_type=str(resource_type).upper() if resource_type else None,
+        campaign_id=_clean_id(campaign_id) if campaign_id else None,
+        when=when,
+        actor=guard.current_actor(),
+    )

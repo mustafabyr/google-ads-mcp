@@ -55,7 +55,10 @@ def apply_guardrails(sub_mcp: FastMCP, namespace: str) -> Dict[str, str]:
     """
     # Local import: guard pulls in the session machinery, which imports
     # utils; keeping it here avoids an import cycle at package import time.
-    from ads_mcp.guardrails import guard
+    from ads_mcp.guardrails import audit_log, guard
+
+    # Every write attempt from here on leaves a line in the audit log.
+    audit_log.install()
 
     applied: Dict[str, str] = {}
     for tool in registered_tools(sub_mcp):
