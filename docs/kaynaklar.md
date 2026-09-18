@@ -71,6 +71,11 @@ yıl sonra yanlış bilgi kaynağıdır — bu dosya onu engellemek için var.
 | 39 | `segments.click_type` ile filtrelenen sorguda alanın SELECT'te de olması zorunlu | `GÖZLEM` | İstek kimliği `hvpndczlKRL7nP1HcJvNrg`: "The following field must be present in SELECT clause: 'segments.click_type'" | 2026-09-18 |
 | 40 | `metrics.phone_calls` / `metrics.phone_impressions` `FROM customer` ile seçilemez; kampanya düzeyinden toplanır | `GÖZLEM` | "could not support requested resources: 'CUSTOMER'" (üretim hesabı, 2026-09-18) | 2026-09-18 |
 | 41 | Plan modunda yer tutucu kimlik (`9990000000000001` gibi 16 haneli) ve negatif kimlik GAQL'de kabul edilir ve 0 satır döner | `GÖZLEM` | `campaign.id = -1` ve `campaign.id = 99999999999999` sorguları üretim hesabında 0 satırla döndü | 2026-09-18 |
+| 42 | Denetim: Hedef Gösterim Payı hedefi %50'nin altında, sıra kaybı %30'un üstünde ve bütçe kaybı %5'in altındaysa "strateji yarışmayı bırakmış, bütçe boşta" | `KONVANSİYON` | Sahada bir hesapta görülen durumun eşiklenmiş hâli; Google eşiği değil, müşteriye öyle sunma | — |
+| 43 | Denetim: tek reklam grubu kampanya harcamasının %50'sinden fazlasını alıp 30 günde 0 birincil dönüşüm üretiyorsa uyarı | `KONVANSİYON` | Sahada görülen durumun eşiklenmiş hâli (Faz 3 brifi, İP-6) | — |
+| 44 | Denetim: 12'den az başlıklı RSA "ince" sayılır (Google 15'e kadar izin verir, tavsiyesi çok başlık) | `KONVANSİYON` | Faz 3 brifi, İP-6; Google'ın dokümanındaki "15 başlığa kadar" ile uyumlu, eşik uygulama tercihi | — |
+| 45 | Denetim: panelden yapılmış değişiklikler son 7 günde `change_event.client_type = 'GOOGLE_ADS_WEB_CLIENT'` ile okunur ve karar günlüğüyle (±2 gün, kaynak türü) eşleştirilir | `GÖZLEM` | Sorgu üretim hesabında doğrulandı (2026-09-18): `client_type` filtresi çalışıyor | 2026-09-18 |
+| 46 | Negatif ↔ pozitif çakışması: GENİŞ negatif tüm kelimeleri içeriyorsa, SIRALI negatif kelimeler sırayla geçiyorsa, TAM negatif metin aynıysa anahtar kelimeyi engeller | `DOKÜMAN` | https://support.google.com/google-ads/answer/2453972 (negatif eşleme türleri) | 2026-09-18 |
 
 ## Kural
 

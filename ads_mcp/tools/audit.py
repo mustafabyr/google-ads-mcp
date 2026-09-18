@@ -33,7 +33,19 @@ before anyone noticed:
     subscription nobody had turned off;
   * a 108-term negative list attached to nothing;
   * two ads disapproved for a final URL that did not exist;
-  * one ad per ad group everywhere, so nothing was ever being tested.
+  * one ad per ad group everywhere, so nothing was ever being tested;
+  * Maximize Clicks with no CPC ceiling, paying whatever the auction asked;
+  * a Target Impression Share campaign aiming low, losing to rank and
+    leaving budget unspent, all at once;
+  * calls biddable on an account whose contract said forms only;
+  * a single biddable goal that had recorded nothing for a month;
+  * a call extension pointed at a conversion action that was never set;
+  * two OUTBOUND_CLICK actions counting the same click twice;
+  * one-word broad negatives in a shared list, and negatives that blocked
+    the account's own keywords;
+  * one ad group taking most of a campaign's money and converting nothing;
+  * responsive search ads with a handful of headlines;
+  * changes made in the interface that nobody had written down.
 
 Read-only. It changes nothing and it asks for no confirmation; it is
 meant to be safe to run on any account at any time.
@@ -60,6 +72,19 @@ _IS_CEILING = 0.9001
 CRITICAL = "critical"
 WARNING = "warning"
 NOTE = "note"
+
+# Thresholds. Every one of these has a row in docs/kaynaklar.md; the
+# KONVANSIYON ones are practice, not Google's word, and the findings say so.
+_TIS_LOW_TARGET = 0.50  # Target Impression Share below this is "low"
+_RANK_LOST_HIGH = 0.30  # losing this much to rank is "high"
+_BUDGET_LOST_LOW = 0.05  # losing this little to budget is "unused"
+_AD_GROUP_SPEND_SHARE = 0.50  # one ad group taking more than this
+_MIN_RSA_HEADLINES = 12  # fewer headlines than this is thin
+_UNLOGGED_WINDOW_DAYS = 7  # interface changes are compared over this
+
+# Conversion categories that mean "a phone call".
+_CALL_CATEGORIES = {"PHONE_CALL_LEAD", "CONTACT"}
+_LEAD_CONTRACTS = {"FORM_ONLY", "CALLS_ONLY", "FORMS_AND_CALLS"}
 
 _ORDER = {CRITICAL: 0, WARNING: 1, NOTE: 2}
 
@@ -189,7 +214,9 @@ def _check_account_settings(cid: str, f: _Findings) -> Dict[str, Any]:
     }
 
 
-def _check_conversions(cid: str, f: _Findings) -> Dict[str, Any]:
+def _check_conversions(
+    cid: str, f: _Findings, lead_contract: Optional[str] = None
+) -> Dict[str, Any]:
     """What actually reaches bidding, decided by the goals -- not the flags.
 
     The account's conversion GOALS, keyed by (category, origin), decide
@@ -224,6 +251,7 @@ def _check_conversions(cid: str, f: _Findings) -> Dict[str, Any]:
         """
         SELECT conversion_action.resource_name, conversion_action.name,
                conversion_action.category, conversion_action.origin,
+               conversion_action.status,
                conversion_action.include_in_conversions_metric
         FROM conversion_action
         WHERE conversion_action.status != 'REMOVED'
@@ -236,6 +264,7 @@ def _check_conversions(cid: str, f: _Findings) -> Dict[str, Any]:
         cid,
         """
         SELECT segments.conversion_action, segments.conversion_action_name,
+               segments.conversion_action_category,
                metrics.conversions, metrics.all_conversions
         FROM campaign
         WHERE segments.date DURING LAST_30_DAYS
@@ -244,6 +273,7 @@ def _check_conversions(cid: str, f: _Findings) -> Dict[str, Any]:
     )
 
     totals: Dict[str, Dict[str, Any]] = {}
+    by_category: Dict[str, float] = {}
     for row in rows:
         seg = row.get("segments", {})
         m = row.get("metrics", {})
@@ -254,6 +284,10 @@ def _check_conversions(cid: str, f: _Findings) -> Dict[str, Any]:
         )
         entry["conversions"] += float(m.get("conversions") or 0)
         entry["all"] += float(m.get("all_conversions") or 0)
+        category = _enum(seg.get("conversion_action_category")) or "UNKNOWN"
+        by_category[category] = by_category.get(category, 0.0) + float(
+            m.get("all_conversions") or 0
+        )
 
     counted = 0.0
     stranded: List[Dict[str, Any]] = []
@@ -291,26 +325,120 @@ def _check_conversions(cid: str, f: _Findings) -> Dict[str, Any]:
             evidence=stranded[:5],
         )
 
+    # --- the goals that bid, and whether they have recorded anything ------
+    biddable_categories = sorted({c for (c, _), b in goals.items() if b if c})
+    silent = [
+        c for c in biddable_categories if by_category.get(c, 0.0) <= 0
+    ]
+    if biddable_categories and len(silent) == len(biddable_categories):
+        f.add(
+            CRITICAL,
+            "measurement",
+            "Every goal the account bids toward recorded nothing in 30 days."
+            if len(biddable_categories) > 1
+            else "The only goal the account bids toward recorded nothing in "
+            "30 days.",
+            "Smart bidding has no signal at all: either the tag is not "
+            "firing, the wrong category is biddable, or the action that "
+            "does record is not a goal. Check the tag first, then the goals.",
+            evidence={"biddable": biddable_categories, "recorded_30d": by_category},
+        )
+    elif silent:
+        f.add(
+            NOTE,
+            "measurement",
+            f"{len(silent)} biddable goal(s) recorded nothing in 30 days.",
+            "A biddable category with no records adds nothing and hides a "
+            "broken tag. Confirm each one still fires.",
+            evidence={"silent": silent, "recorded_30d": by_category},
+        )
+
+    # --- the contract: forms only, but calls are biddable -----------------
+    contract = str(lead_contract or "").upper() or None
+    if contract and contract not in _LEAD_CONTRACTS:
+        raise ValueError(
+            f"lead_contract must be one of {sorted(_LEAD_CONTRACTS)}, not "
+            f"{lead_contract!r}."
+        )
+    if contract == "FORM_ONLY":
+        call_goals = sorted(
+            f"{c}/{o}" for (c, o), b in goals.items() if b and c in _CALL_CATEGORIES
+        )
+        if call_goals:
+            f.add(
+                WARNING,
+                "measurement",
+                "The contract counts forms only, but call goals are biddable.",
+                "Bidding is chasing phone calls the client does not pay for. "
+                "Make CONTACT and PHONE_CALL_LEAD non-biddable at account "
+                "level, or on the campaigns, with set_campaign_conversion_goals.",
+                evidence=call_goals,
+            )
+    if contract == "CALLS_ONLY":
+        form_goals = sorted(
+            f"{c}/{o}" for (c, o), b in goals.items()
+            if b and c in {"SUBMIT_LEAD_FORM", "SIGNUP", "REQUEST_QUOTE"}
+        )
+        if form_goals:
+            f.add(
+                WARNING,
+                "measurement",
+                "The contract counts calls only, but form goals are biddable.",
+                "Bidding is chasing forms the client does not pay for.",
+                evidence=form_goals,
+            )
+
+    # --- the same click counted twice ------------------------------------
+    outbound = [
+        a.get("name")
+        for a in settings.values()
+        if _enum(a.get("category")) == "OUTBOUND_CLICK"
+        and _enum(a.get("status")) == "ENABLED"
+    ]
+    if len(outbound) > 1:
+        f.add(
+            WARNING,
+            "measurement",
+            f"{len(outbound)} enabled OUTBOUND_CLICK actions.",
+            "The same outbound click (WhatsApp, a phone link) is recorded by "
+            "each of them, so conversions and cost per conversion are "
+            "wrong by that factor. Keep one; retire the rest in the "
+            "interface (the API cannot change an action's status).",
+            evidence=outbound,
+        )
+
     return {
         "biddable_goals": sorted(
             f"{c}/{o}" for (c, o), b in goals.items() if b
         ),
         "conversions_counted_30d": round(counted, 1),
+        "recorded_by_category_30d": {
+            k: round(v, 1) for k, v in sorted(by_category.items())
+        },
     }
 
 
-def _check_campaigns(cid: str, f: _Findings) -> Dict[str, Any]:
+def _check_campaigns(
+    cid: str, f: _Findings, brand_campaign_ids: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    brand = {_clean_id(b) for b in (brand_campaign_ids or [])}
     rows = _rows(
         cid,
         """
         SELECT campaign.id, campaign.name, campaign.status,
                campaign.advertising_channel_type,
                campaign.bidding_strategy_type,
+               campaign.target_spend.cpc_bid_ceiling_micros,
+               campaign.target_impression_share.location,
+               campaign.target_impression_share.location_fraction_micros,
+               campaign.network_settings.target_search_network,
+               campaign.network_settings.target_content_network,
                campaign.geo_target_type_setting.positive_geo_target_type,
                campaign_budget.amount_micros,
                campaign_budget.id,
                metrics.cost_micros, metrics.clicks, metrics.conversions,
                metrics.search_budget_lost_impression_share,
+               metrics.search_rank_lost_impression_share,
                metrics.search_impression_share
         FROM campaign
         WHERE campaign.status = 'ENABLED'
@@ -321,6 +449,10 @@ def _check_campaigns(cid: str, f: _Findings) -> Dict[str, Any]:
     interest = []
     starved = []
     thin_is = []
+    no_ceiling = []
+    tis_stuck = []
+    partners = []
+    display = []
     budget_ids: Dict[str, List[str]] = {}
     live: List[Dict[str, Any]] = []
 
@@ -330,12 +462,14 @@ def _check_campaigns(cid: str, f: _Findings) -> Dict[str, Any]:
         b = row.get("campaign_budget", {})
         name = c.get("name")
         cost = _from_micros(m.get("cost_micros"))
+        bidding = _enum(c.get("bidding_strategy_type"))
+        channel = _enum(c.get("advertising_channel_type"))
         live.append(
             {
                 "id": c["id"],
                 "name": name,
-                "channel": _enum(c.get("advertising_channel_type")),
-                "bidding": _enum(c.get("bidding_strategy_type")),
+                "channel": channel,
+                "bidding": bidding,
                 "cost_30d": cost,
                 "conversions_30d": round(float(m.get("conversions") or 0), 1),
             }
@@ -344,8 +478,41 @@ def _check_campaigns(cid: str, f: _Findings) -> Dict[str, Any]:
         geo = _enum(
             (c.get("geo_target_type_setting") or {}).get("positive_geo_target_type")
         )
-        if geo == "PRESENCE_OR_INTEREST":
+        if geo == "PRESENCE_OR_INTEREST" and str(c["id"]) not in brand:
             interest.append(name)
+
+        # Maximize Clicks is TARGET_SPEND underneath. With no ceiling it
+        # pays whatever the auction asks for a click.
+        if bidding == "TARGET_SPEND":
+            ceiling = int((c.get("target_spend") or {}).get("cpc_bid_ceiling_micros") or 0)
+            if not ceiling:
+                no_ceiling.append(name)
+
+        rank_lost = float(m.get("search_rank_lost_impression_share") or 0)
+        budget_lost = float(m.get("search_budget_lost_impression_share") or 0)
+        if bidding == "TARGET_IMPRESSION_SHARE":
+            tis = c.get("target_impression_share") or {}
+            fraction = int(tis.get("location_fraction_micros") or 0) / 1_000_000
+            if (
+                fraction < _TIS_LOW_TARGET
+                and rank_lost >= _RANK_LOST_HIGH
+                and budget_lost < _BUDGET_LOST_LOW
+            ):
+                tis_stuck.append(
+                    {
+                        "campaign": name,
+                        "target_share": round(fraction * 100, 1),
+                        "rank_lost_is": round(rank_lost * 100, 1),
+                        "budget_lost_is": round(budget_lost * 100, 1),
+                    }
+                )
+
+        network = c.get("network_settings") or {}
+        if channel == "SEARCH":
+            if network.get("target_search_network"):
+                partners.append(name)
+            if network.get("target_content_network"):
+                display.append(name)
 
         lost = m.get("search_budget_lost_impression_share")
         if lost is not None and float(lost) >= 0.10:
@@ -400,6 +567,50 @@ def _check_campaigns(cid: str, f: _Findings) -> Dict[str, Any]:
             "(bid and quality) before budget.",
             evidence=thin_is[:8],
         )
+    if no_ceiling:
+        f.add(
+            WARNING,
+            "bidding",
+            f"{len(no_ceiling)} Maximize Clicks campaign(s) have no CPC ceiling.",
+            "Without target_spend.cpc_bid_ceiling_micros the strategy pays "
+            "whatever holding a click costs. Set a ceiling with "
+            "update_bid_strategy(MAXIMIZE_CLICKS, cpc_bid_ceiling=...).",
+            evidence=no_ceiling,
+        )
+    if tis_stuck:
+        f.add(
+            WARNING,
+            "bidding",
+            f"{len(tis_stuck)} Target Impression Share campaign(s) aim low, "
+            "lose to rank and leave budget unused.",
+            f"The target is under {int(_TIS_LOW_TARGET * 100)}%, rank-lost "
+            f"share is over {int(_RANK_LOST_HIGH * 100)}% and budget-lost "
+            f"share is under {int(_BUDGET_LOST_LOW * 100)}%: the strategy has "
+            "stopped competing while money sits unspent. Raise the target "
+            "or the CPC ceiling (thresholds are practice, not Google's).",
+            evidence=tis_stuck,
+        )
+    if display:
+        f.add(
+            WARNING,
+            "targeting",
+            f"{len(display)} search campaign(s) also serve on the Display "
+            "network.",
+            "Display placements spend a search budget on people who were "
+            "not searching. Turn it off with update_campaign(content_network"
+            "=False).",
+            evidence=display,
+        )
+    if partners:
+        f.add(
+            NOTE,
+            "targeting",
+            f"{len(partners)} search campaign(s) include search partners.",
+            "Partner traffic converts worse on most accounts and cannot be "
+            "bid separately. Compare with get_performance_by_segment(network)"
+            " and turn it off if it does not pay.",
+            evidence=partners,
+        )
 
     return {"live_campaigns": live}
 
@@ -409,7 +620,8 @@ def _check_ads(cid: str, f: _Findings) -> None:
         cid,
         """
         SELECT campaign.name, ad_group.id, ad_group.name, ad_group.status,
-               ad_group_ad.ad.id, ad_group_ad.status,
+               ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status,
+               ad_group_ad.ad.responsive_search_ad.headlines,
                ad_group_ad.ad_strength,
                ad_group_ad.policy_summary.approval_status,
                ad_group_ad.policy_summary.policy_topic_entries
@@ -423,6 +635,7 @@ def _check_ads(cid: str, f: _Findings) -> None:
     disapproved = []
     limited = []
     poor = []
+    thin = []
     per_group: Dict[str, Dict[str, Any]] = {}
 
     for row in rows:
@@ -435,6 +648,21 @@ def _check_ads(cid: str, f: _Findings) -> None:
         )
         if _enum(ad.get("status")) == "ENABLED":
             slot["enabled_ads"] += 1
+
+        inner = ad.get("ad") or {}
+        if (
+            _enum(inner.get("type_") or inner.get("type")) == "RESPONSIVE_SEARCH_AD"
+            and _enum(ad.get("status")) == "ENABLED"
+        ):
+            headlines = (inner.get("responsive_search_ad") or {}).get("headlines") or []
+            if len(headlines) < _MIN_RSA_HEADLINES:
+                thin.append(
+                    {
+                        "where": f"{row['campaign']['name']} / {group.get('name')}",
+                        "ad_id": inner.get("id"),
+                        "headlines": len(headlines),
+                    }
+                )
 
         summary = ad.get("policy_summary") or {}
         approval = _enum(summary.get("approval_status"))
@@ -503,6 +731,18 @@ def _check_ads(cid: str, f: _Findings) -> None:
             "that does cost reach.",
             evidence=poor[:8],
         )
+    if thin:
+        f.add(
+            NOTE,
+            "creative",
+            f"{len(thin)} responsive search ad(s) have fewer than "
+            f"{_MIN_RSA_HEADLINES} headlines.",
+            "Google assembles the ad from the headlines it is given; with "
+            "few of them it has little to combine and fewer auctions to "
+            "enter. Fill them with update_ad_text (practice, not a Google "
+            "rule).",
+            evidence=thin[:10],
+        )
 
 
 def _check_negatives(cid: str, f: _Findings) -> None:
@@ -564,6 +804,364 @@ def _check_negatives(cid: str, f: _Findings) -> None:
             "Every campaign gets the account's master list, or the same "
             "junk gets paid for once per campaign.",
             evidence=missing,
+        )
+
+    # --- one-word BROAD negatives in shared lists --------------------------
+    shared_terms = _rows(
+        cid,
+        """
+        SELECT shared_set.id, shared_set.name,
+               shared_criterion.keyword.text,
+               shared_criterion.keyword.match_type
+        FROM shared_criterion
+        WHERE shared_set.status = 'ENABLED'
+          AND shared_set.type = 'NEGATIVE_KEYWORDS'
+        """,
+    )
+    one_word_broad = []
+    terms_by_set: Dict[str, List[tuple]] = {}
+    for r in shared_terms:
+        kw = (r.get("shared_criterion") or {}).get("keyword") or {}
+        text = str(kw.get("text") or "").strip()
+        match = _enum(kw.get("match_type")) or ""
+        if not text:
+            continue
+        terms_by_set.setdefault(str(r["shared_set"]["id"]), []).append((text, match))
+        if match == "BROAD" and len(text.split()) == 1:
+            one_word_broad.append({"list": r["shared_set"].get("name"), "term": text})
+    if one_word_broad:
+        f.add(
+            NOTE,
+            "negatives",
+            f"{len(one_word_broad)} one-word BROAD negative(s) in shared lists.",
+            "A one-word broad negative blocks every query containing that "
+            "word, in any phrase. Right for 'free' or 'jobs'; wrong for a "
+            "word the account's own keywords use. Read them.",
+            evidence=one_word_broad[:15],
+        )
+
+    # --- negatives that block the account's own keywords -------------------
+    attached_sets = _rows(
+        cid,
+        """
+        SELECT campaign.id, shared_set.id, shared_set.type
+        FROM campaign_shared_set
+        WHERE campaign_shared_set.status != 'REMOVED'
+          AND shared_set.type = 'NEGATIVE_KEYWORDS'
+        """,
+    )
+    negatives: Dict[str, List[tuple]] = {}
+    for r in attached_sets:
+        campaign_id = str(r["campaign"]["id"])
+        for term in terms_by_set.get(str(r["shared_set"]["id"]), []):
+            negatives.setdefault(campaign_id, []).append(term + ("shared list",))
+    for r in _rows(
+        cid,
+        """
+        SELECT campaign.id, campaign_criterion.keyword.text,
+               campaign_criterion.keyword.match_type,
+               campaign_criterion.negative
+        FROM campaign_criterion
+        WHERE campaign_criterion.type = 'KEYWORD'
+          AND campaign_criterion.negative = true
+          AND campaign.status = 'ENABLED'
+        """,
+    ):
+        kw = (r.get("campaign_criterion") or {}).get("keyword") or {}
+        if kw.get("text"):
+            negatives.setdefault(str(r["campaign"]["id"]), []).append(
+                (str(kw["text"]), _enum(kw.get("match_type")) or "", "campaign")
+            )
+    group_negatives: Dict[str, List[tuple]] = {}
+    for r in _rows(
+        cid,
+        """
+        SELECT campaign.id, ad_group.id, ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type,
+               ad_group_criterion.negative
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.negative = true
+          AND campaign.status = 'ENABLED'
+        """,
+    ):
+        kw = (r.get("ad_group_criterion") or {}).get("keyword") or {}
+        if kw.get("text"):
+            group_negatives.setdefault(str(r["ad_group"]["id"]), []).append(
+                (str(kw["text"]), _enum(kw.get("match_type")) or "", "ad group")
+            )
+    positives = _rows(
+        cid,
+        """
+        SELECT campaign.id, campaign.name, ad_group.id,
+               ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.negative = false
+          AND ad_group_criterion.status = 'ENABLED'
+          AND ad_group.status = 'ENABLED'
+          AND campaign.status = 'ENABLED'
+        """,
+    )
+    clashes = []
+    for r in positives:
+        kw = (r.get("ad_group_criterion") or {}).get("keyword") or {}
+        text = str(kw.get("text") or "").strip()
+        if not text:
+            continue
+        campaign_id = str(r["campaign"]["id"])
+        candidates = negatives.get(campaign_id, []) + group_negatives.get(
+            str(r["ad_group"]["id"]), []
+        )
+        for neg_text, neg_match, where in candidates:
+            if _negative_blocks(neg_text, neg_match, text):
+                clashes.append(
+                    {
+                        "campaign": r["campaign"].get("name"),
+                        "keyword": text,
+                        "negative": neg_text,
+                        "negative_match": neg_match,
+                        "negative_level": where,
+                    }
+                )
+    if clashes:
+        f.add(
+            WARNING,
+            "negatives",
+            f"{len(clashes)} keyword(s) are blocked by the account's own negatives.",
+            "The keyword is bought and then the negative throws the query "
+            "away, so the money buys nothing. Remove the negative "
+            "(shared_sets_remove_terms / remove_negative_keywords) or the "
+            "keyword.",
+            evidence=clashes[:15],
+        )
+
+
+def _negative_blocks(negative: str, match: str, keyword: str) -> bool:
+    """Whether a negative keyword would stop a query equal to ``keyword``.
+
+    The rules are Google's, on the keyword's own text as the query:
+    BROAD blocks when every word of the negative appears; PHRASE when the
+    negative's words appear in order; EXACT when the texts are the same.
+    """
+    neg = negative.casefold().split()
+    kw = keyword.casefold().split()
+    if not neg or not kw:
+        return False
+    if match == "EXACT":
+        return neg == kw
+    if match == "PHRASE":
+        return any(kw[i : i + len(neg)] == neg for i in range(len(kw) - len(neg) + 1))
+    return all(word in kw for word in neg)
+
+
+def _check_ad_group_spend(cid: str, f: _Findings, min_cost: float) -> None:
+    """One ad group eating most of a campaign's money and converting nothing."""
+    rows = _rows(
+        cid,
+        """
+        SELECT campaign.id, campaign.name, ad_group.id, ad_group.name,
+               metrics.cost_micros, metrics.conversions
+        FROM ad_group
+        WHERE segments.date DURING LAST_30_DAYS
+          AND campaign.status = 'ENABLED'
+          AND ad_group.status = 'ENABLED'
+        """,
+    )
+    by_campaign: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        m = r.get("metrics", {})
+        slot = by_campaign.setdefault(
+            str(r["campaign"]["id"]),
+            {"name": r["campaign"].get("name"), "cost": 0.0, "groups": []},
+        )
+        cost = _from_micros(m.get("cost_micros"))
+        slot["cost"] += cost
+        slot["groups"].append(
+            {
+                "ad_group": r["ad_group"].get("name"),
+                "cost": cost,
+                "conversions": float(m.get("conversions") or 0),
+            }
+        )
+    hogs = []
+    for campaign in by_campaign.values():
+        if campaign["cost"] <= 0:
+            continue
+        for group in campaign["groups"]:
+            share = group["cost"] / campaign["cost"]
+            if (
+                share > _AD_GROUP_SPEND_SHARE
+                and group["conversions"] == 0
+                and group["cost"] >= min_cost
+            ):
+                hogs.append(
+                    {
+                        "campaign": campaign["name"],
+                        "ad_group": group["ad_group"],
+                        "cost_30d": round(group["cost"], 2),
+                        "share_of_campaign": round(share * 100, 1),
+                        "ad_groups_in_campaign": len(campaign["groups"]),
+                    }
+                )
+    if hogs:
+        f.add(
+            WARNING,
+            "structure",
+            f"{len(hogs)} ad group(s) take over {int(_AD_GROUP_SPEND_SHARE * 100)}% "
+            "of their campaign's spend with no conversion.",
+            "Most of the campaign's money goes to a group that has not "
+            "produced a primary conversion in 30 days. Read its search "
+            "terms; then lower its bids, narrow its keywords or pause it "
+            "(practice, not a Google rule).",
+            evidence=hogs[:10],
+        )
+
+
+def _check_call_extensions(cid: str, f: _Findings) -> None:
+    """A call button whose calls are counted nowhere."""
+    rows = _rows(
+        cid,
+        """
+        SELECT campaign.id, campaign.name, asset.id,
+               asset.call_asset.call_conversion_reporting_state,
+               asset.call_asset.call_conversion_action,
+               campaign_asset.field_type
+        FROM campaign_asset
+        WHERE campaign_asset.field_type = 'CALL'
+          AND campaign_asset.status != 'REMOVED'
+        """,
+    )
+    broken = []
+    for r in rows:
+        call = (r.get("asset") or {}).get("call_asset") or {}
+        state = _enum(call.get("call_conversion_reporting_state"))
+        if state == "USE_RESOURCE_LEVEL_CALL_CONVERSION_ACTION" and not call.get(
+            "call_conversion_action"
+        ):
+            broken.append(
+                {
+                    "campaign": r["campaign"].get("name"),
+                    "asset_id": (r.get("asset") or {}).get("id"),
+                }
+            )
+    if broken:
+        f.add(
+            WARNING,
+            "measurement",
+            f"{len(broken)} call extension(s) count calls into no conversion action.",
+            "The reporting state says 'use my own action' and none is set: "
+            "the button shows, people call, nothing is counted. Repoint "
+            "with update_call_extension(use_account_default=True).",
+            evidence=broken,
+        )
+
+
+def _check_unlogged_changes(cid: str, f: _Findings) -> None:
+    """Changes made in the interface that the decision log does not explain."""
+    from ads_mcp.guardrails import audit_log
+
+    today = datetime.date.today()
+    since = today - datetime.timedelta(days=_UNLOGGED_WINDOW_DAYS)
+    until = today + datetime.timedelta(days=1)
+    rows = _rows(
+        cid,
+        f"""
+        SELECT change_event.change_date_time,
+               change_event.change_resource_type,
+               change_event.resource_change_operation,
+               change_event.client_type, change_event.user_email,
+               change_event.campaign, change_event.changed_fields
+        FROM change_event
+        WHERE change_event.change_date_time >= '{since.isoformat()}'
+          AND change_event.change_date_time <= '{until.isoformat()}'
+          AND change_event.client_type = 'GOOGLE_ADS_WEB_CLIENT'
+        ORDER BY change_event.change_date_time DESC
+        LIMIT 500
+        """,
+    )
+    if not rows:
+        return
+
+    logged = audit_log.read(
+        cid,
+        since=(since - datetime.timedelta(days=2)).isoformat(),
+        until=until.isoformat(),
+        limit=2000,
+    )
+    manual = [e for e in logged if e.get("source") == "manual"]
+
+    def documented(when: datetime.datetime, resource_type: str) -> bool:
+        for entry in manual:
+            stamp = entry.get("time_utc") or ""
+            try:
+                logged_at = datetime.datetime.fromisoformat(stamp)
+            except ValueError:
+                continue
+            if logged_at.tzinfo is None:
+                logged_at = logged_at.replace(tzinfo=datetime.timezone.utc)
+            if abs((logged_at - when).total_seconds()) > 2 * 86400:
+                continue
+            wanted = (entry.get("arguments") or {}).get("resource_type")
+            if not wanted or wanted == resource_type:
+                return True
+        return False
+
+    undocumented: Dict[tuple, Dict[str, Any]] = {}
+    for r in rows:
+        e = r["change_event"]
+        stamp = str(e.get("change_date_time") or "")
+        try:
+            when = datetime.datetime.fromisoformat(stamp.replace(" ", "T"))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        resource_type = _enum(e.get("change_resource_type")) or "UNKNOWN"
+        if documented(when, resource_type):
+            continue
+        key = (
+            stamp[:10],
+            resource_type,
+            _enum(e.get("resource_change_operation")),
+            e.get("user_email"),
+            (e.get("campaign") or "").rsplit("/", 1)[-1],
+        )
+        slot = undocumented.setdefault(
+            key,
+            {
+                "day": key[0],
+                "resource": key[1],
+                "operation": key[2],
+                "who": key[3],
+                "campaign_id": key[4] or None,
+                "fields": [],
+                "count": 0,
+            },
+        )
+        slot["count"] += 1
+        # proto-plus renders a FieldMask as "a,b,c", not as a dict.
+        changed = e.get("changed_fields") or ""
+        paths = (
+            changed.split(",") if isinstance(changed, str)
+            else list(changed.get("paths") or [])
+        )
+        for path in [p for p in paths if p][:5]:
+            if path not in slot["fields"]:
+                slot["fields"].append(path)
+
+    if undocumented:
+        total = sum(v["count"] for v in undocumented.values())
+        f.add(
+            NOTE,
+            "governance",
+            f"{total} change(s) made in the interface in the last "
+            f"{_UNLOGGED_WINDOW_DAYS} days have no entry in the decision log.",
+            "Somebody changed the account by hand and nothing says why. Ask, "
+            "then write it down with audit_log_manual_change so the next "
+            "person does not undo it.",
+            evidence=sorted(undocumented.values(), key=lambda v: v["day"], reverse=True)[:15],
         )
 
 
@@ -732,6 +1330,8 @@ def _audit_account(
     customer_id: str,
     min_wasted_cost: float = 50.0,
     skip_search_terms: bool = False,
+    brand_campaign_ids: Optional[List[str]] = None,
+    lead_contract: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The audit itself, callable from Python.
 
@@ -769,11 +1369,14 @@ def _audit_account(
             return None
 
     header = _check_account_settings(cid, f)  # fatal on purpose: no account, no audit
-    conversions = run("conversions", _check_conversions, cid, f) or {}
-    campaigns = run("campaigns", _check_campaigns, cid, f) or {}
+    conversions = run("conversions", _check_conversions, cid, f, lead_contract) or {}
+    campaigns = run("campaigns", _check_campaigns, cid, f, brand_campaign_ids) or {}
     run("ads", _check_ads, cid, f)
     run("negatives", _check_negatives, cid, f)
+    run("ad_group_spend", _check_ad_group_spend, cid, f, min_wasted_cost)
+    run("call_extensions", _check_call_extensions, cid, f)
     run("auto_apply", _check_auto_apply, cid, f)
+    run("unlogged_changes", _check_unlogged_changes, cid, f)
     run("keyword_overlap", _check_keyword_overlap, cid, f)
     if not skip_search_terms:
         run("wasted_spend", _check_wasted_spend, cid, f, min_wasted_cost)
@@ -818,6 +1421,8 @@ def run_account_audit(
     customer_id: str,
     min_wasted_cost: float = 50.0,
     skip_search_terms: bool = False,
+    brand_campaign_ids: Optional[List[str]] = None,
+    lead_contract: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Runs the full agency checklist against one account.
 
@@ -831,11 +1436,18 @@ def run_account_audit(
 
     Args:
         customer_id: The Google Ads account id.
-        min_wasted_cost: Only report zero-conversion search terms that
-            spent at least this much in the last 30 days, in account
-            currency. Lower it on small accounts.
+        min_wasted_cost: Only report zero-conversion search terms, and
+            ad groups, that spent at least this much in the last 30 days,
+            in account currency. Lower it on small accounts.
         skip_search_terms: Skip the search-term sweep, which is the
             slowest check on a large account.
+        brand_campaign_ids: Campaigns to leave out of the
+            PRESENCE_OR_INTEREST check -- a brand campaign may legitimately
+            want people interested in the area from elsewhere.
+        lead_contract: What the client pays for: FORM_ONLY, CALLS_ONLY or
+            FORMS_AND_CALLS. With FORM_ONLY, biddable call goals are
+            reported; with CALLS_ONLY, biddable form goals are. Omit to
+            skip that check.
 
     Returns:
         The account header, the live campaigns, and the ranked findings.
@@ -844,6 +1456,8 @@ def run_account_audit(
         customer_id,
         min_wasted_cost=min_wasted_cost,
         skip_search_terms=skip_search_terms,
+        brand_campaign_ids=brand_campaign_ids,
+        lead_contract=lead_contract,
     )
 
 @audit_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -851,6 +1465,7 @@ def run_portfolio_audit(
     manager_customer_id: str,
     min_wasted_cost: float = 50.0,
     skip_search_terms: bool = True,
+    lead_contracts: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Runs the account audit across every account under a manager.
 
@@ -870,6 +1485,8 @@ def run_portfolio_audit(
         manager_customer_id: The manager (MCC) account id.
         min_wasted_cost: Passed through to each account audit.
         skip_search_terms: Passed through to each account audit.
+        lead_contracts: Optional map of customer id to FORM_ONLY,
+            CALLS_ONLY or FORMS_AND_CALLS, for the contract check.
 
     Returns:
         Per-account counts and verdicts, plus findings grouped across
@@ -895,11 +1512,16 @@ def run_portfolio_audit(
         c = row["customer_client"]
         cid = str(c["id"])
         name = c.get("descriptive_name") or cid
+        contract = None
+        for key, value in (lead_contracts or {}).items():
+            if _clean_id(key) == cid:
+                contract = value
         try:
             audit = _audit_account(
                 cid,
                 min_wasted_cost=min_wasted_cost,
                 skip_search_terms=skip_search_terms,
+                lead_contract=contract,
             )
         except Exception as exc:  # noqa: BLE001
             unreachable.append({"customer_id": cid, "name": name, "error": str(exc)[:200]})
