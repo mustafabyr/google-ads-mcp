@@ -229,10 +229,21 @@ class FakeAds:
 
     @contextlib.contextmanager
     def installed(self):
-        """Routes ads_mcp.utils at this fake for the duration."""
+        """Routes ads_mcp.utils at this fake for the duration.
+
+        The quota counter writes a file per day; point it at a scratch
+        directory so tests never touch the real ~/.google-ads-mcp.
+        """
+        import os
+        import tempfile
+
         client = FakeClient(self)
-        with patch("ads_mcp.utils._get_googleads_client", return_value=client):
-            yield self
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {"GOOGLE_ADS_MCP_QUOTA_DIR": os.path.join(scratch, "quota")}
+            with patch.dict(os.environ, env), patch(
+                "ads_mcp.utils._get_googleads_client", return_value=client
+            ):
+                yield self
 
     # --- assertions ---------------------------------------------------------
     def calls_to(self, service_method: str) -> List[Dict[str, Any]]:

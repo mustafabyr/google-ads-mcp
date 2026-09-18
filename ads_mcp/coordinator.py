@@ -24,6 +24,7 @@ from typing import Any
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 from ads_mcp.auth_storage import create_client_storage
+from ads_mcp.guardrails.access import AllowedEmailsMiddleware
 
 _CLIENT_ID = os.environ.get("GOOGLE_ADS_MCP_OAUTH_CLIENT_ID")
 _CLIENT_SECRET = os.environ.get("GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET")
@@ -49,7 +50,11 @@ if _CLIENT_ID and _CLIENT_SECRET:
         provider_kwargs["client_storage"] = client_storage
 
     auth = GoogleProvider(**provider_kwargs)
-    mcp = FastMCP("Google Ads Server", auth=auth)
+    # Only the Google accounts on GOOGLE_ADS_MCP_ALLOWED_EMAILS get past
+    # the token check; see ads_mcp/guardrails/access.py.
+    mcp = FastMCP(
+        "Google Ads Server", auth=auth, middleware=[AllowedEmailsMiddleware()]
+    )
 else:
     mcp = FastMCP("Google Ads Server")
 

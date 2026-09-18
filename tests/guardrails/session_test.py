@@ -225,9 +225,12 @@ class TestApplyMode(unittest.TestCase):
         self.assertEqual(len(session.writes), 1)
         self.assertEqual(len(fake.calls), 1)
 
-    def test_no_session_means_no_proxy(self):
+    def test_no_session_means_a_counting_proxy_only(self):
         fake = FakeAds()
         with fake.installed():
             service = utils.get_googleads_service("CampaignBudgetService")
-        self.assertNotIsInstance(service, S.ServiceProxy)
+            response = service.mutate_campaign_budgets(customer_id=CID, operations=[_budget_create()])
+        self.assertIsInstance(service, S.ServiceProxy)
         self.assertIsNone(S.current())
+        self.assertEqual(len(fake.calls), 1)  # passed straight through
+        self.assertEqual(response.results[0].resource_name, "customers/0/campaignBudgets/1001")

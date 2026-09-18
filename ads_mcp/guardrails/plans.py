@@ -53,6 +53,10 @@ logger = logging.getLogger(__name__)
 
 PLAN_DIR_ENV = "GOOGLE_ADS_MCP_PLAN_DIR"
 DEFAULT_PLAN_DIR = "~/.google-ads-mcp/plans"
+# On Cloud Run an instance can be recycled between the plan and the apply
+# (min-instances is 0), so plans live in a bucket there, not on the disk.
+PLAN_GCS_BUCKET_ENV = "GOOGLE_ADS_MCP_PLAN_GCS_BUCKET"
+GCS_PREFIX = "plans"
 TTL_ENV = "GOOGLE_ADS_MCP_PLAN_TTL_MINUTES"
 DEFAULT_TTL_MINUTES = 30
 KEEP_FINISHED_DAYS = 7
@@ -273,7 +277,90 @@ class PlanStore:
         return removed
 
 
+class GcsPlanStore(PlanStore):
+    """The same store, as objects in a bucket, for Cloud Run."""
+
+    def __init__(self, bucket_name: str) -> None:
+        super().__init__(pathlib.Path(f"gs://{bucket_name}/{GCS_PREFIX}"))
+        from google.cloud import storage  # optional dependency
+        from google.api_core import exceptions as gexc
+
+        self._exc = gexc
+        self._bucket = storage.Client().bucket(bucket_name)
+        self._bucket_name = bucket_name
+
+    def _blob(self, plan_id: str, suffix: str = ".json"):
+        self.path(plan_id)  # validates the id
+        return self._bucket.blob(f"{GCS_PREFIX}/{plan_id}{suffix}")
+
+    def save(self, plan: Plan) -> None:
+        self._blob(plan.plan_id).upload_from_string(
+            json.dumps(plan.to_json(), default=str),
+            content_type="application/json",
+        )
+
+    def load(self, plan_id: str) -> Plan:
+        try:
+            text = self._blob(plan_id).download_as_text()
+        except self._exc.NotFound:
+            raise PlanNotFound(
+                f"No plan {plan_id} in gs://{self._bucket_name}/{GCS_PREFIX}. "
+                f"Plans expire after {ttl_minutes()} minutes; make a new one."
+            ) from None
+        return Plan.from_json(json.loads(text))
+
+    def all(self) -> List[Plan]:
+        plans = []
+        for blob in self._bucket.list_blobs(prefix=f"{GCS_PREFIX}/plan-"):
+            if not blob.name.endswith(".json"):
+                continue
+            try:
+                plans.append(Plan.from_json(json.loads(blob.download_as_text())))
+            except (ValueError, TypeError) as exc:
+                logger.warning("Unreadable plan object %s: %s", blob.name, exc)
+        return sorted(plans, key=lambda p: p.plan_id)
+
+    @contextlib.contextmanager
+    def lock(self, plan_id: str) -> Iterator[None]:
+        blob = self._blob(plan_id, ".lock")
+        try:
+            blob.upload_from_string("locked", if_generation_match=0)
+        except self._exc.PreconditionFailed:
+            raise PlanNotOpen(
+                f"Plan {plan_id} is being applied right now by another "
+                f"call. Wait for it and read the plan's status."
+            ) from None
+        try:
+            yield
+        finally:
+            try:
+                blob.delete()
+            except Exception:  # noqa: BLE001
+                logger.warning("Could not remove lock for plan %s", plan_id)
+
+    def purge(self, now: Optional[datetime.datetime] = None) -> int:
+        now = now or utcnow()
+        removed = 0
+        for plan in self.all():
+            if plan.status in OPEN_STATES and plan.is_expired(now):
+                plan.status = EXPIRED
+                self.save(plan)
+            created = _parse(plan.created_at)
+            if plan.status not in OPEN_STATES and (
+                now - created
+            ) > datetime.timedelta(days=KEEP_FINISHED_DAYS):
+                try:
+                    self._blob(plan.plan_id).delete()
+                    removed += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        return removed
+
+
 def store() -> PlanStore:
+    bucket = os.environ.get(PLAN_GCS_BUCKET_ENV)
+    if bucket:
+        return GcsPlanStore(bucket)
     return PlanStore()
 
 

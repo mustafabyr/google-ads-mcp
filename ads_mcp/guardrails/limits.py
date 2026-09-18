@@ -63,6 +63,11 @@ import yaml
 
 LIMITS_PATH_ENV = "GOOGLE_ADS_MCP_LIMITS_PATH"
 DEFAULT_LIMITS_PATH = "~/.google-ads-mcp/limits.yaml"
+# On Cloud Run the file is a mounted secret (LIMITS_PATH points at it) or
+# an object in a bucket: "gs://bucket/limits.yaml". The object is
+# re-read at most every LIMITS_GCS_TTL_SECONDS.
+LIMITS_GCS_URI_ENV = "GOOGLE_ADS_MCP_LIMITS_GCS_URI"
+LIMITS_GCS_TTL_SECONDS = 300
 
 _MICROS = 1_000_000
 
@@ -209,7 +214,30 @@ class Limits:
 _cache: Dict[str, Any] = {"path": None, "mtime": None, "limits": None}
 
 
+def _load_gcs(uri: str) -> Limits:
+    from google.cloud import storage  # optional dependency
+
+    bucket_name, _, blob_name = uri[len("gs://") :].partition("/")
+    text = storage.Client().bucket(bucket_name).blob(blob_name).download_as_text()
+    return Limits(yaml.safe_load(text) or {}, source=uri)
+
+
 def current() -> Limits:
+    uri = os.environ.get(LIMITS_GCS_URI_ENV)
+    if uri:
+        import time
+
+        stamp = int(time.time() // LIMITS_GCS_TTL_SECONDS)
+        if (
+            _cache["limits"] is None
+            or _cache["path"] != uri
+            or _cache["mtime"] != stamp
+        ):
+            _cache.update(
+                {"path": uri, "mtime": stamp, "limits": _load_gcs(uri)}
+            )
+        return _cache["limits"]
+
     path = limits_path()
     mtime = path.stat().st_mtime if path.exists() else None
     if (

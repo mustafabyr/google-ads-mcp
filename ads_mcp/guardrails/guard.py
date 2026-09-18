@@ -48,7 +48,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ads_mcp.guardrails import changes as changes_mod
-from ads_mcp.guardrails import classes, direction, impact, limits
+from ads_mcp.guardrails import classes, direction, impact, limits, quota
 from ads_mcp.guardrails.session import (
     APPLY,
     DIRECT,
@@ -295,6 +295,17 @@ def plan_or_write(
     return plan.summary()
 
 
+def with_quota_warning(result: Any) -> Any:
+    """Adds the day's quota warning to a dict result once past the mark."""
+    try:
+        message = quota.warning()
+    except Exception:  # noqa: BLE001 - never fail a tool over bookkeeping
+        return result
+    if message and isinstance(result, dict):
+        result.setdefault("quota_warning", message)
+    return result
+
+
 def wrap(
     fn: Callable[..., Any], *, namespace: str, tool_name: str, cls: str
 ) -> Callable[..., Any]:
@@ -306,6 +317,9 @@ def wrap(
 
     @functools.wraps(fn)
     def guarded(*args: Any, **kwargs: Any) -> Any:
+        return with_quota_warning(_dispatch(*args, **kwargs))
+
+    def _dispatch(*args: Any, **kwargs: Any) -> Any:
         if cls == classes.READ or key in classes.EXECUTORS:
             return fn(*args, **kwargs)
         call = bound_kwargs(fn, args, kwargs)

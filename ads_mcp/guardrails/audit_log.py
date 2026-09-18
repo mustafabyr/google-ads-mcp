@@ -170,6 +170,29 @@ def _write_gcs(entry: Dict[str, Any]) -> None:
         logger.exception("Could not write the audit line to gs://%s", bucket_name)
 
 
+def _read_gcs(months: List[str]) -> List[Dict[str, Any]]:
+    """Entries from the bucket for these months; empty when unconfigured."""
+    bucket_name = os.environ.get(GCS_BUCKET_ENV)
+    if not bucket_name:
+        return []
+    try:
+        from google.cloud import storage
+    except ImportError:
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        bucket = storage.Client().bucket(bucket_name)
+        for month in months:
+            for blob in bucket.list_blobs(prefix=f"{GCS_PREFIX}/{month}/"):
+                try:
+                    entries.append(json.loads(blob.download_as_text()))
+                except ValueError:
+                    continue
+    except Exception:  # noqa: BLE001 - a log read must not fail a report
+        logger.exception("Could not read the audit log from gs://%s", bucket_name)
+    return entries
+
+
 def record(event: Dict[str, Any]) -> Dict[str, Any]:
     """Writes one line everywhere it should go; returns the entry."""
     entry = _entry_from_event(event)
@@ -253,7 +276,26 @@ def read(
     directory = audit_dir()
     out: List[Dict[str, Any]] = []
     sequence = 0
-    for month in _months_between(start, end):
+    seen: set = set()
+
+    def keep(entry: Dict[str, Any]) -> None:
+        nonlocal sequence
+        when = _parse_time(entry.get("time_utc"))
+        if when is None or when < start or when > end:
+            return
+        if wanted and entry.get("customer_id") != wanted:
+            return
+        if tool and entry.get("tool") != tool:
+            return
+        key = json.dumps(entry, sort_keys=True, default=str)
+        if key in seen:
+            return
+        seen.add(key)
+        sequence += 1
+        out.append((entry.get("time_utc", ""), sequence, entry))
+
+    months = _months_between(start, end)
+    for month in months:
         path = directory / f"{month}.jsonl"
         if not path.exists():
             continue
@@ -263,18 +305,11 @@ def read(
                 if not line:
                     continue
                 try:
-                    entry = json.loads(line)
+                    keep(json.loads(line))
                 except ValueError:
                     continue
-                when = _parse_time(entry.get("time_utc"))
-                if when is None or when < start or when > end:
-                    continue
-                if wanted and entry.get("customer_id") != wanted:
-                    continue
-                if tool and entry.get("tool") != tool:
-                    continue
-                sequence += 1
-                out.append((entry.get("time_utc", ""), sequence, entry))
+    for entry in _read_gcs(months):
+        keep(entry)
     # Newest first; two lines in the same second keep their written order,
     # so the later one still comes first.
     out.sort(key=lambda item: (item[0], item[1]), reverse=True)

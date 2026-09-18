@@ -391,10 +391,8 @@ def current() -> Optional[WriteSession]:
 
 
 def wrap_service(service: Any, name: str) -> Any:
-    session = _SESSION.get()
-    if session is None:
-        return service
-    return ServiceProxy(service, name, session)
+    """The proxy for the current session, or a counting-only proxy."""
+    return ServiceProxy(service, name, _SESSION.get())
 
 
 def _camel(snake: str) -> str:
@@ -412,10 +410,38 @@ class _HasField:
         return self._field
 
 
-class ServiceProxy:
-    """Sees every call a tool makes on one service."""
+# Read RPCs that are not search but still cost an operation.
+_OTHER_READS = frozenset(
+    {
+        "search_google_ads_fields",
+        "suggest_geo_target_constants",
+        "generate_keyword_ideas",
+        "generate_keyword_historical_metrics",
+        "list_accessible_customers",
+    }
+)
 
-    def __init__(self, real: Any, name: str, session: WriteSession) -> None:
+
+def _count(n: int) -> None:
+    """Adds to the day's operation count; never raises."""
+    try:
+        from ads_mcp.guardrails import quota
+
+        quota.add(n)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class ServiceProxy:
+    """Sees every call a tool makes on one service.
+
+    With a session it records and, in plan mode, captures. Without one it
+    only counts the call against the daily quota and passes it through.
+    """
+
+    def __init__(
+        self, real: Any, name: str, session: Optional[WriteSession]
+    ) -> None:
         self._real = real
         self._name = name
         self._session = session
@@ -424,8 +450,22 @@ class ServiceProxy:
         if attr in READ_METHODS:
             return functools.partial(self._read, attr)
         if is_write_method(attr):
+            if self._session is None:
+                return functools.partial(self._counted_write, attr)
             return functools.partial(self._write, attr)
+        if attr in _OTHER_READS:
+            return functools.partial(self._counted_call, attr)
         return getattr(self._real, attr)
+
+    def _counted_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        _count(1)
+        return getattr(self._real, method)(*args, **kwargs)
+
+    def _counted_write(self, method: str, request: Any = None, **kwargs: Any):
+        _, payload, _ = self._unpack(method, request, kwargs)
+        _count(max(len(payload), 1))
+        real = getattr(self._real, method)
+        return real(request=request, **kwargs) if request is not None else real(**kwargs)
 
     # --- reads --------------------------------------------------------------
     def _read(self, method: str, request: Any = None, **kwargs: Any) -> Any:
@@ -436,6 +476,9 @@ class ServiceProxy:
             query = getattr(request, "query", query)
         real = getattr(self._real, method)
         result = real(request, **kwargs) if request is not None else real(**kwargs)
+        _count(1)
+        if self._session is None:
+            return result
         if method == "search_stream":
             batches = list(result)
             rows = [row for batch in batches for row in batch.results]
@@ -466,7 +509,10 @@ class ServiceProxy:
             ):
                 if hasattr(request, name):
                     fields.setdefault(name, getattr(request, name))
-        customer_id = str(fields.get("customer_id") or self._session.customer_id)
+        customer_id = str(
+            fields.get("customer_id")
+            or (self._session.customer_id if self._session else "")
+        )
         if method == "mutate":
             payload = list(fields.get("mutate_operations") or [])
         elif method.startswith("upload_"):
@@ -628,6 +674,7 @@ class ServiceProxy:
 
         if session.validate_only:
             validated = self._validate_request(method, request, kwargs)
+            _count(max(len(payload), 1))
             real(request=validated)
             names = self._placeholders(customer_id, rendered)
             session.record_write(
@@ -638,6 +685,7 @@ class ServiceProxy:
             )
             return self._synthetic(method, rendered, names, payload)
 
+        _count(max(len(payload), 1))
         response = (
             real(request=request, **kwargs) if request is not None
             else real(**kwargs)
