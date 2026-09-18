@@ -144,29 +144,12 @@ def create_ad_group(
     }
 
 
-@adgroups_mcp.tool
-def set_ad_group_status(
-    customer_id: str,
-    ad_group_id: str,
-    status: str,
-    confirm_remove: bool = False,
+def _change_ad_group_status(
+    customer_id: str, ad_group_id: str, status: str, confirm_remove: bool
 ) -> Dict[str, Any]:
-    """Enables, pauses or removes an ad group.
-
-    Unlike a campaign, enabling an ad group does not by itself start spending
-    -- the campaign gate still applies -- so ENABLED needs no confirmation.
-    REMOVED is not reversible and requires confirm_remove=True.
-
-    Args:
-        customer_id: The Google Ads account id.
-        ad_group_id: The ad group to change.
-        status: ENABLED, PAUSED or REMOVED.
-        confirm_remove: Required for REMOVED.
-
-    Returns:
-        The ad group's state read back after the change.
-    """
+    """Shared by set_ad_group_status, pause_ad_group and enable_ad_group."""
     customer_id = _clean_id(customer_id)
+    ad_group_id = _clean_id(ad_group_id)
     status = status.upper()
     if status not in {"ENABLED", "PAUSED", "REMOVED"}:
         raise ValueError("status must be ENABLED, PAUSED or REMOVED.")
@@ -177,10 +160,20 @@ def set_ad_group_status(
             "confirm_remove=True."
         )
 
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT ad_group.id, ad_group.name, ad_group.status
+        FROM ad_group WHERE ad_group.id = {ad_group_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No ad group {ad_group_id} in account {customer_id}.")
+
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("AdGroupService")
     operation = client.get_type("AdGroupOperation")
-    resource_name = service.ad_group_path(customer_id, _clean_id(ad_group_id))
+    resource_name = service.ad_group_path(customer_id, ad_group_id)
 
     if status == "REMOVED":
         operation.remove = resource_name
@@ -197,15 +190,82 @@ def set_ad_group_status(
 
     return {
         "ad_group_id": ad_group_id,
+        "previous_status": current[0]["ad_group"].get("status"),
         "new_status": status,
         "verified": _read_back(
             customer_id,
             f"""
             SELECT ad_group.id, ad_group.name, ad_group.status
-            FROM ad_group WHERE ad_group.id = {_clean_id(ad_group_id)}
+            FROM ad_group WHERE ad_group.id = {ad_group_id}
             """,
         ),
     }
+
+
+@adgroups_mcp.tool
+def set_ad_group_status(
+    customer_id: str,
+    ad_group_id: str,
+    status: str,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Enables, pauses or removes an ad group. DEPRECATED: prefer the split tools.
+
+    Use pause_ad_group and enable_ad_group instead; this tool does both and
+    stays for one release only.
+
+    Unlike a campaign, enabling an ad group does not by itself start spending
+    -- the campaign gate still applies -- so ENABLED needs no confirmation.
+    REMOVED is not reversible and requires confirm_remove=True.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group to change.
+        status: ENABLED, PAUSED or REMOVED.
+        confirm_remove: Required for REMOVED.
+
+    Returns:
+        The ad group's state read back after the change.
+    """
+    return _change_ad_group_status(
+        customer_id, ad_group_id, status, confirm_remove
+    )
+
+
+@adgroups_mcp.tool
+def pause_ad_group(
+    customer_id: str,
+    ad_group_id: str,
+) -> Dict[str, Any]:
+    """Pauses an ad group. Its ads and keywords stop serving; nothing is lost.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group to pause.
+
+    Returns:
+        The ad group's status before and after, read back from the API.
+    """
+    return _change_ad_group_status(customer_id, ad_group_id, "PAUSED", False)
+
+
+@adgroups_mcp.tool
+def enable_ad_group(
+    customer_id: str,
+    ad_group_id: str,
+) -> Dict[str, Any]:
+    """Enables an ad group. It serves only if its campaign is enabled too.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group to enable.
+
+    Returns:
+        The ad group's status before and after, read back from the API.
+    """
+    return _change_ad_group_status(
+        customer_id, ad_group_id, "ENABLED", False
+    )
 
 
 # --------------------------------------------------------------------------
@@ -638,41 +698,41 @@ def update_ad_group_bid(
     }
 
 
-@adgroups_mcp.tool
-def set_keyword_status(
+def _change_keyword_status(
     customer_id: str,
     ad_group_id: str,
     criterion_ids: List[str],
     status: str,
-    confirm_remove: bool = False,
+    confirm_remove: bool,
 ) -> Dict[str, Any]:
-    """Enables, pauses or removes keywords.
-
-    PAUSED is the safe way to stop a keyword: it stops serving but keeps its
-    history, so it can be turned back on. Prefer this over remove_keywords.
-    ENABLED needs no confirmation -- the campaign is still the spend gate.
-
-    Args:
-        customer_id: The Google Ads account id.
-        ad_group_id: The ad group the keywords belong to.
-        criterion_ids: Criterion ids, from add_keywords or a search query.
-        status: ENABLED, PAUSED or REMOVED.
-        confirm_remove: Required for REMOVED, which discards history.
-
-    Returns:
-        The keywords' state read back after the change.
-    """
+    """Shared by set_keyword_status, pause_keywords and enable_keywords."""
     customer_id = _clean_id(customer_id)
     ad_group_id = _clean_id(ad_group_id)
     status = status.upper()
     if status not in {"ENABLED", "PAUSED", "REMOVED"}:
         raise ValueError("status must be ENABLED, PAUSED or REMOVED.")
+    if not criterion_ids:
+        raise ValueError("Give at least one criterion id.")
     if status == "REMOVED" and not confirm_remove:
         raise ValueError(
             f"Removing {len(criterion_ids)} keyword(s) discards their history "
             f"and is not reversible. Pausing keeps the history and can be "
             f"undone. To remove anyway, call again with confirm_remove=True."
         )
+
+    ids = ",".join(_clean_id(c) for c in criterion_ids)
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT ad_group_criterion.criterion_id,
+               ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type,
+               ad_group_criterion.status
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.criterion_id IN ({ids})
+          AND ad_group.id = {ad_group_id}
+        """,
+    )
 
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("AdGroupCriterionService")
@@ -700,11 +760,11 @@ def set_keyword_status(
         customer_id=customer_id, operations=operations
     )
 
-    ids = ",".join(_clean_id(c) for c in criterion_ids)
     return {
         "ad_group_id": ad_group_id,
         "new_status": status,
         "changed": len(operations),
+        "before": [row["ad_group_criterion"] for row in current],
         "verified": _read_back(
             customer_id,
             f"""
@@ -718,6 +778,80 @@ def set_keyword_status(
             """,
         ),
     }
+
+
+@adgroups_mcp.tool
+def set_keyword_status(
+    customer_id: str,
+    ad_group_id: str,
+    criterion_ids: List[str],
+    status: str,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Enables, pauses or removes keywords. DEPRECATED: prefer the split tools.
+
+    Use pause_keywords and enable_keywords instead; this tool does both and
+    stays for one release only.
+
+    PAUSED is the safe way to stop a keyword: it stops serving but keeps its
+    history, so it can be turned back on. Prefer this over remove_keywords.
+    ENABLED needs no confirmation -- the campaign is still the spend gate.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the keywords belong to.
+        criterion_ids: Criterion ids, from add_keywords or a search query.
+        status: ENABLED, PAUSED or REMOVED.
+        confirm_remove: Required for REMOVED, which discards history.
+
+    Returns:
+        The keywords' state read back after the change.
+    """
+    return _change_keyword_status(
+        customer_id, ad_group_id, criterion_ids, status, confirm_remove
+    )
+
+
+@adgroups_mcp.tool
+def pause_keywords(
+    customer_id: str,
+    ad_group_id: str,
+    criterion_ids: List[str],
+) -> Dict[str, Any]:
+    """Pauses keywords. They stop serving and keep their history.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the keywords belong to.
+        criterion_ids: Criterion ids, from add_keywords or a search query.
+
+    Returns:
+        The keywords' state before and after, read back from the API.
+    """
+    return _change_keyword_status(
+        customer_id, ad_group_id, criterion_ids, "PAUSED", False
+    )
+
+
+@adgroups_mcp.tool
+def enable_keywords(
+    customer_id: str,
+    ad_group_id: str,
+    criterion_ids: List[str],
+) -> Dict[str, Any]:
+    """Enables keywords. They serve only if their ad group and campaign do.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the keywords belong to.
+        criterion_ids: Criterion ids, from add_keywords or a search query.
+
+    Returns:
+        The keywords' state before and after, read back from the API.
+    """
+    return _change_keyword_status(
+        customer_id, ad_group_id, criterion_ids, "ENABLED", False
+    )
 
 
 @adgroups_mcp.tool
@@ -989,30 +1123,14 @@ def remove_negative_keywords(
 # --------------------------------------------------------------------------
 
 
-@adgroups_mcp.tool
-def set_ad_status(
+def _change_ad_status(
     customer_id: str,
     ad_group_id: str,
     ad_id: str,
     status: str,
-    confirm_remove: bool = False,
+    confirm_remove: bool,
 ) -> Dict[str, Any]:
-    """Enables, pauses or removes a single ad.
-
-    Pausing a weak ad while leaving its siblings running is the normal way to
-    test creative. Enabling needs no confirmation -- the campaign is still the
-    spend gate.
-
-    Args:
-        customer_id: The Google Ads account id.
-        ad_group_id: The ad group the ad belongs to.
-        ad_id: The ad to change.
-        status: ENABLED, PAUSED or REMOVED.
-        confirm_remove: Required for REMOVED, which is not reversible.
-
-    Returns:
-        The ad's state read back after the change.
-    """
+    """Shared by set_ad_status, pause_ad and enable_ad."""
     customer_id = _clean_id(customer_id)
     ad_group_id = _clean_id(ad_group_id)
     ad_id = _clean_id(ad_id)
@@ -1025,6 +1143,17 @@ def set_ad_status(
             "Pausing stops it serving and can be undone. To remove anyway, "
             "call again with confirm_remove=True."
         )
+
+    current = _read_back(
+        customer_id,
+        f"""
+        SELECT ad_group_ad.ad.id, ad_group_ad.status,
+               ad_group_ad.policy_summary.approval_status
+        FROM ad_group_ad WHERE ad_group_ad.ad.id = {ad_id}
+        """,
+    )
+    if not current:
+        raise ValueError(f"No ad {ad_id} in account {customer_id}.")
 
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("AdGroupAdService")
@@ -1050,6 +1179,7 @@ def set_ad_status(
     return {
         "ad_group_id": ad_group_id,
         "ad_id": ad_id,
+        "previous_status": current[0]["ad_group_ad"].get("status"),
         "new_status": status,
         "verified": _read_back(
             customer_id,
@@ -1060,6 +1190,78 @@ def set_ad_status(
             """,
         ),
     }
+
+
+@adgroups_mcp.tool
+def set_ad_status(
+    customer_id: str,
+    ad_group_id: str,
+    ad_id: str,
+    status: str,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Enables, pauses or removes a single ad. DEPRECATED: prefer the split tools.
+
+    Use pause_ad and enable_ad instead; this tool does both and stays for one
+    release only.
+
+    Pausing a weak ad while leaving its siblings running is the normal way to
+    test creative. Enabling needs no confirmation -- the campaign is still the
+    spend gate.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the ad belongs to.
+        ad_id: The ad to change.
+        status: ENABLED, PAUSED or REMOVED.
+        confirm_remove: Required for REMOVED, which is not reversible.
+
+    Returns:
+        The ad's state read back after the change.
+    """
+    return _change_ad_status(
+        customer_id, ad_group_id, ad_id, status, confirm_remove
+    )
+
+
+@adgroups_mcp.tool
+def pause_ad(
+    customer_id: str,
+    ad_group_id: str,
+    ad_id: str,
+) -> Dict[str, Any]:
+    """Pauses one ad. Its siblings keep serving; its history is kept.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the ad belongs to.
+        ad_id: The ad to pause.
+
+    Returns:
+        The ad's status before and after, read back from the API.
+    """
+    return _change_ad_status(customer_id, ad_group_id, ad_id, "PAUSED", False)
+
+
+@adgroups_mcp.tool
+def enable_ad(
+    customer_id: str,
+    ad_group_id: str,
+    ad_id: str,
+) -> Dict[str, Any]:
+    """Enables one ad. It serves only if its ad group and campaign do.
+
+    Args:
+        customer_id: The Google Ads account id.
+        ad_group_id: The ad group the ad belongs to.
+        ad_id: The ad to enable.
+
+    Returns:
+        The ad's status before and after, read back from the API.
+    """
+    return _change_ad_status(
+        customer_id, ad_group_id, ad_id, "ENABLED", False
+    )
 
 
 @adgroups_mcp.tool

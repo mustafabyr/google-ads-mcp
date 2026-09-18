@@ -374,31 +374,14 @@ def create_search_campaign(
     }
 
 
-@campaigns_mcp.tool
-def set_campaign_status(
+def _change_campaign_status(
     customer_id: str,
     campaign_id: str,
     status: str,
-    confirm_spend: bool = False,
-    confirm_remove: bool = False,
+    confirm_spend: bool,
+    confirm_remove: bool,
 ) -> Dict[str, Any]:
-    """Enables, pauses or removes a campaign.
-
-    ENABLED starts real spending and requires confirm_spend=True.
-    REMOVED is not reversible and requires confirm_remove=True.
-    PAUSED always works without confirmation — stopping spend is always safe.
-
-    Args:
-        customer_id: The Google Ads account id.
-        campaign_id: The campaign to change.
-        status: ENABLED, PAUSED or REMOVED.
-        confirm_spend: Required for ENABLED. Pass True only after showing the
-            user the daily and implied monthly budget and getting a yes.
-        confirm_remove: Required for REMOVED.
-
-    Returns:
-        The campaign's state read back after the change.
-    """
+    """Shared by set_campaign_status, pause_campaign and enable_campaign."""
     customer_id = _clean_id(customer_id)
     status = status.upper()
     if status not in {"ENABLED", "PAUSED", "REMOVED"}:
@@ -453,6 +436,7 @@ def set_campaign_status(
 
     return {
         "campaign_id": campaign_id,
+        "previous_status": current[0]["campaign"].get("status"),
         "new_status": status,
         "daily_budget": daily,
         "verified": _read_back(
@@ -463,6 +447,90 @@ def set_campaign_status(
             """,
         ),
     }
+
+
+@campaigns_mcp.tool
+def set_campaign_status(
+    customer_id: str,
+    campaign_id: str,
+    status: str,
+    confirm_spend: bool = False,
+    confirm_remove: bool = False,
+) -> Dict[str, Any]:
+    """Enables, pauses or removes a campaign. DEPRECATED: prefer the split tools.
+
+    Use pause_campaign to stop spend and enable_campaign to start it. This
+    tool does both, which means a client cannot allow pausing without also
+    allowing enabling; it stays for one release and then goes.
+
+    ENABLED starts real spending and requires confirm_spend=True.
+    REMOVED is not reversible and requires confirm_remove=True.
+    PAUSED always works without confirmation -- stopping spend is always safe.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to change.
+        status: ENABLED, PAUSED or REMOVED.
+        confirm_spend: Required for ENABLED. Pass True only after showing the
+            user the daily and implied monthly budget and getting a yes.
+        confirm_remove: Required for REMOVED.
+
+    Returns:
+        The campaign's state read back after the change.
+    """
+    return _change_campaign_status(
+        customer_id, campaign_id, status, confirm_spend, confirm_remove
+    )
+
+
+@campaigns_mcp.tool
+def pause_campaign(
+    customer_id: str,
+    campaign_id: str,
+) -> Dict[str, Any]:
+    """Pauses a campaign. Stopping spend is always safe, so nothing is asked.
+
+    The campaign keeps its history, its ads and its keywords and can be
+    enabled again with enable_campaign. This is the right first move when
+    something looks wrong and the cause is not yet known.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to pause.
+
+    Returns:
+        The campaign's status before and after, read back from the API.
+    """
+    return _change_campaign_status(
+        customer_id, campaign_id, "PAUSED", False, False
+    )
+
+
+@campaigns_mcp.tool
+def enable_campaign(
+    customer_id: str,
+    campaign_id: str,
+    confirm_spend: bool = False,
+) -> Dict[str, Any]:
+    """Enables a campaign, which starts real spending.
+
+    This is the single gate that lets money move: everything under a
+    campaign is created ENABLED and stays silent until the campaign itself
+    is. The refusal carries the daily budget and the implied monthly figure
+    so the user can be shown real numbers before agreeing.
+
+    Args:
+        customer_id: The Google Ads account id.
+        campaign_id: The campaign to enable.
+        confirm_spend: Required. Pass True only after showing the user the
+            daily and implied monthly budget and getting a yes.
+
+    Returns:
+        The campaign's status before and after, read back from the API.
+    """
+    return _change_campaign_status(
+        customer_id, campaign_id, "ENABLED", confirm_spend, False
+    )
 
 
 # --------------------------------------------------------------------------

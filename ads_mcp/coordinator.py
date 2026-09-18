@@ -57,6 +57,7 @@ else:
 def initialize_and_mount_tools(parent_mcp: FastMCP) -> None:
     """Loads the tools configuration and dynamically mounts the tools sub-servers."""
     from ads_mcp.config import ToolsConfig
+    from ads_mcp.guardrails.install import apply_guardrails
     import importlib
     import pkgutil
     import ads_mcp.tools as tools_pkg
@@ -91,6 +92,10 @@ def initialize_and_mount_tools(parent_mcp: FastMCP) -> None:
         for name in tool_names:
             if not config.is_tool_enabled(category, name):
                 sub_mcp.local_provider.remove_tool(name)
+
+        # Classify every remaining tool and put the guard in front of it. A
+        # tool without a class does not mount -- this raises.
+        apply_guardrails(sub_mcp, category)
 
         # Determine prefix/namespace
         namespace_prefix = config.get_namespace_prefix(category)
