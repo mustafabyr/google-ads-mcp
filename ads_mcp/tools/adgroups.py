@@ -286,12 +286,21 @@ def create_responsive_search_ad(
     descriptions: List[str],
     path1: Optional[str] = None,
     path2: Optional[str] = None,
+    status: str = "ENABLED",
 ) -> Dict[str, Any]:
     """Creates a responsive search ad.
 
     Google's character limits are checked here BEFORE the call, so a too-long
     headline fails loudly with the offending text instead of being rejected
     with an opaque API error.
+
+    Ads are created ENABLED by default: the spend gate in this server is the
+    CAMPAIGN, which is always created paused, and one clear gate beats
+    several. status="PAUSED" is for the other case -- an ad added to a
+    campaign that is ALREADY serving, where born-enabled means it starts
+    competing with the ad it was meant to be reviewed against. Without it the
+    only route was to create the ad enabled and pause it on the next call,
+    which leaves a live window between the two.
 
     Args:
         customer_id: The Google Ads account id.
@@ -302,6 +311,8 @@ def create_responsive_search_ad(
         descriptions: 2-4 descriptions, each at most 90 characters.
         path1: Optional display-URL path segment, at most 15 characters.
         path2: Optional second path segment, at most 15 characters.
+        status: ENABLED (default) or PAUSED. REMOVED is refused -- an ad is
+            removed with a remove operation, not a status.
 
     Returns:
         The ad's id and its read-back state.
@@ -340,6 +351,13 @@ def create_responsive_search_ad(
     if not final_url.startswith(("http://", "https://")):
         raise ValueError("final_url must start with http:// or https://")
 
+    status = str(status).strip().upper()
+    if status not in {"ENABLED", "PAUSED"}:
+        raise ValueError(
+            f"status must be ENABLED or PAUSED, got {status!r}. An ad is not "
+            f"removed by a status: that needs a remove operation."
+        )
+
     client = utils.get_googleads_client()
     service = utils.get_googleads_service("AdGroupAdService")
     ad_group_service = utils.get_googleads_service("AdGroupService")
@@ -349,7 +367,7 @@ def create_responsive_search_ad(
     ad_group_ad.ad_group = ad_group_service.ad_group_path(
         customer_id, ad_group_id
     )
-    ad_group_ad.status = client.enums.AdGroupAdStatusEnum.ENABLED
+    ad_group_ad.status = getattr(client.enums.AdGroupAdStatusEnum, status)
     ad_group_ad.ad.final_urls.append(final_url)
 
     for text in headlines:
@@ -374,11 +392,17 @@ def create_responsive_search_ad(
     return {
         "ad_id": ad_id,
         "resource_name": resource_name,
+        "status": status,
         "headlines": len(headlines),
         "descriptions": len(descriptions),
         "note": (
             "The ad goes to Google review before it can serve. The parent "
             "campaign is still the spend gate."
+            + (
+                " Created PAUSED: it will not serve until enable_ad."
+                if status == "PAUSED"
+                else ""
+            )
         ),
         "verified": _read_back(
             customer_id,

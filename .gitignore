@@ -49,3 +49,6 @@ token.json
 
 # Per-account spending ceilings: private, per client. Only the example ships.
 limits.yaml
+
+# Local scratch output of AI sessions
+Claude outputs/

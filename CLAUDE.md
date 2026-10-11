@@ -85,11 +85,13 @@ mounts them automatically; enable the namespace in `ads_mcp/tools_config.yaml`.
 | `pmax.py` | `pmax` | Performance Max campaigns, asset groups, image assets, signals |
 | `keyword_research.py` | `keyword_research` | search volume, competition, top-of-page bid ranges |
 | `reports.py` | `reports` | campaign list, performance, structure, search terms, wasted spend |
-| `extensions.py` | `extensions` | sitelinks, callouts, structured snippets, call extensions (add + repoint) |
+| `extensions.py` | `extensions` | sitelinks, callouts, structured snippets, call extensions (add + repoint), price tables (add + replace), image assets (upload + link, routed by ratio), account-level extensions (list + unlink) |
 | `conversions.py` | `conversions` | conversion actions (create + update), tag snippets, campaign conversion goals |
 | `adgroups.py` | `adgroups` | ad groups, responsive search ads and their text, ad status, keywords and their bids/match types/status, negative keywords |
 | `audit.py` | `audit` | the agency checklist as one call: `run_account_audit` for one account, `run_portfolio_audit` for every account under an MCC with findings grouped across accounts; `get_change_log` reads this server's own audit log, `log_manual_change` writes down a change made in the interface |
 | `plans.py` | `plans` | the second step of every SPEND or DESTRUCTIVE write: `apply_plan`, `get_plan`, `list_plans`, `discard_plan` |
+| `bidding_strategies.py` | `bidding_strategies` | portfolio (shared) bidding strategies: list them with their campaigns and Google's own `bidding_strategy_system_status`, set a portfolio CPC ceiling, move a campaign off a portfolio strategy onto its own (and back) |
+| `_bidding.py` | — | the campaign-level bidding scheme and its update-mask leaves, in one place, called as a plain helper by both `campaigns.py` and `bidding_strategies.py` |
 | `negatives.py` | `negatives` | Turkish suffix and unaccented forms for a negative keyword; pure function, adds nothing |
 | `core.py`, `search.py`, `get_resource_metadata.py` | — | Google's originals, unmodified |
 
@@ -303,6 +305,32 @@ These cost a debugging session each. Check them in every new tool.
   existing users" and points at the separate Data Manager API. The call
   still returns success, so the per-row `api_errors` must be read before
   telling anyone the conversions were recorded.
+- An image asset's SLOT is decided by its pixel ratio, not by the caller:
+  1:1 is `SQUARE_MARKETING_IMAGE` and is the one Search actually requires,
+  1.91:1 is `MARKETING_IMAGE` and is optional. Anything else -- a 4:1
+  wordmark above all -- is a logo, and Google's format policy refuses a
+  brand logo used as the image itself. `add_image_assets` reads the PNG/JPEG
+  header before uploading, so a wrong shape never becomes an asset that has
+  to be disapproved first. Eligibility is on the ACCOUNT (60 days old,
+  Search spend in the last 30 days, clean policy history) and Google
+  enforces it at serving time, so a young account can hold these assets and
+  still show none of them.
+- A price asset does not exist in every market, and the API only says so
+  AFTER the operation is sent: two INVALID_ARGUMENTs, `INVALID_LANGUAGE_CODE`
+  on the language and `currency_code_error: UNSUPPORTED` on the money. Google
+  supports price assets in ten languages and twenty-three currencies, and
+  Turkish and TRY are in neither -- so on a Turkish account in lira the
+  extension cannot be built at all, no matter how well-formed the rows are.
+  `add_price_asset` refuses that call before it leaves the process and names
+  the substitute (figures in sitelink descriptions or callouts, which are
+  separate assets and replaceable without sending the ad back to review).
+- A price asset's rows and its NAME are immutable (`CANNOT_MODIFY_ASSET_NAME`,
+  and names must be unique in the account). A price change is therefore a NEW
+  asset plus unlinking the old one, never an edit -- which is why
+  `add_price_asset` takes `replace_existing` and generates a name carrying the
+  date and a digest of the rows. It also means a figure in an RSA headline is
+  the expensive place to put a price: the asset version is data, the headline
+  version goes stale silently and keeps serving.
 - Every tool that CREATES something needs the tool that removes it, in the
   same commit. An experiment, a shared set or a demographic exclusion that
   can be created and not undone leaves the account dirty and leaves the
@@ -313,6 +341,13 @@ These cost a debugging session each. Check them in every new tool.
   read-back looks fine because the six days asked for are all there.
   `set_campaign_ad_schedule` therefore clears the existing schedule by
   default -- a tool named "set" must set.
+- Extensions link at TWO levels. A `customer_asset` (account-level) sitelink
+  or callout is shown by every campaign that has none of that type of its
+  own, and `list_campaign_extensions` never shows it -- a new campaign looks
+  clean and still serves an old "Garantili"/"%100" sitelink to a 301'd URL.
+  `list_account_extensions` reads them, `remove_account_extension` unlinks
+  them (DESTRUCTIVE, plan + confirm_destructive; the asset itself stays), and
+  the audit flags live campaigns that inherit them.
 - A GAQL query must SELECT any field it filters on. `FROM campaign_asset
   WHERE campaign.id = X` fails unless `campaign.id` is also selected.
 - Performance Max has to be built in ONE atomic `GoogleAdsService.mutate`
@@ -353,6 +388,43 @@ These cost a debugging session each. Check them in every new tool.
   sixteen-digit sentinels (`999000000…`), not negative numbers, so that the
   tools' digits-only id cleaning keeps them intact and the read-back after a
   captured create matches nothing instead of the wrong object.
+- A campaign's bidding is in one of TWO places and the read does not say
+  which. `campaign.bidding_strategy` non-empty means a PORTFOLIO (shared)
+  strategy owns the settings; the campaign's own `target_spend`,
+  `target_impression_share` and friends then read 0 -- not "no ceiling", but
+  "not here". Writing campaign-level fields anyway is refused with
+  `bidding_error: BIDDING_STRATEGY_AND_BUDGET_MUST_BE_ALIGNED` pointed at
+  `operations[0].update.bidding_strategy`, a field the operation never set,
+  which is why the error reads as nonsense. Read `campaign.bidding_strategy`
+  BEFORE any bidding write; `campaigns.update_bid_strategy` now refuses such
+  a campaign itself and names the portfolio tool.
+- That error is really about the BUDGET. A portfolio strategy with
+  `aligned_campaign_budget_id` set is welded to that shared budget: the
+  campaigns on the strategy and the campaigns on the budget are the same
+  set, so a campaign cannot leave one without leaving the other. There are
+  exactly two legal ways out -- give the campaign its own budget, or unalign
+  the strategy (which changes it for every campaign on it) -- and they touch
+  different numbers of campaigns, so `detach_campaign_from_portfolio` makes
+  the caller pick instead of guessing.
+- Clearing a portfolio strategy and setting a campaign-level one are ONE
+  operation, mask `["bidding_strategy", <the new scheme's leaves>]`. A
+  campaign with neither is not a legal state, so the two halves cannot be
+  sent separately.
+- `BiddingStrategy` carries `cpc_bid_ceiling_micros` on every scheme,
+  including the conversion-based ones that reject a ceiling at campaign
+  level, and it carries standalone `target_cpa` / `target_roas`, which
+  campaigns do not. So a portfolio ceiling needs its own field path per
+  type -- `ads_mcp/tools/_bidding.PORTFOLIO_CEILING_PATHS`. Every path in
+  that table must also be in `limits._CPC_FIELDS` and
+  `direction._BID_FIELDS`, or a ceiling can be raised past the account's
+  `max_cpc_ceiling_try` with nothing refusing it. The test suite checks the
+  two lists against each other.
+- `campaign.bidding_strategy_system_status` is Google's own verdict on the
+  strategy, free with any campaign read, and nothing here was selecting it.
+  `MISCONFIGURED_CONVERSION_TYPES` means a conversion-based strategy is
+  optimising towards nothing; `LIMITED_BY_CPC_BID_CEILING` means the
+  ceiling, not the budget, is the limit. Select it on every campaign query
+  that is going to make a judgement.
 - `utils.get_googleads_service` always returns a proxy now. Tests must fake
   the client factory (`ads_mcp.utils._get_googleads_client`, see
   `tests/fakes.py`), not the service getter, or the proxy -- and with it the

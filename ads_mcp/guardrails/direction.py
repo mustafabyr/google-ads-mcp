@@ -40,10 +40,16 @@ from ads_mcp.guardrails.limits import Change
 DECREASE = "decrease"
 INCREASE = "increase"
 
+# Campaign and criterion level, then the portfolio bidding_strategy
+# schemes. A lower ceiling is a decrease wherever it sits.
 _BID_FIELDS = (
     "cpc_bid_micros",
     "target_spend.cpc_bid_ceiling_micros",
     "target_impression_share.cpc_bid_ceiling_micros",
+    "maximize_conversions.cpc_bid_ceiling_micros",
+    "maximize_conversion_value.cpc_bid_ceiling_micros",
+    "target_cpa.cpc_bid_ceiling_micros",
+    "target_roas.cpc_bid_ceiling_micros",
 )
 
 

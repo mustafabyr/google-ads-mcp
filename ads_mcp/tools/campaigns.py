@@ -33,6 +33,7 @@ from google.protobuf import field_mask_pb2
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
+from ads_mcp.tools import _bidding
 
 campaigns_mcp = FastMCP("campaigns")
 
@@ -1588,6 +1589,8 @@ def update_bid_strategy(
         f"""
         SELECT campaign.id, campaign.name, campaign.status,
                campaign.bidding_strategy_type,
+               campaign.bidding_strategy,
+               campaign.bidding_strategy_system_status,
                campaign_budget.amount_micros
         FROM campaign WHERE campaign.id = {campaign_id}
         """,
@@ -1597,6 +1600,32 @@ def update_bid_strategy(
 
     old_strategy = current[0]["campaign"]["bidding_strategy_type"]
     daily = _from_micros(int(current[0]["campaign_budget"]["amount_micros"]))
+
+    # A campaign can point at a PORTFOLIO strategy, and then its bidding
+    # settings are not on the campaign at all -- campaign.target_spend
+    # reads 0 because the ceiling lives on the shared strategy. Writing
+    # campaign-level fields anyway is refused by Google with
+    # BIDDING_STRATEGY_AND_BUDGET_MUST_BE_ALIGNED pointed at
+    # update.bidding_strategy, a field this operation never sets, which
+    # is close to unreadable. Catch it here instead, while we know why.
+    portfolio = str(current[0]["campaign"].get("bidding_strategy") or "")
+    if portfolio:
+        raise ValueError(
+            f"Campaign {campaign_id} "
+            f"('{current[0]['campaign'].get('name')}') does not carry its "
+            f"own bidding strategy: it is on PORTFOLIO strategy "
+            f"{portfolio.rsplit('/', 1)[-1]}, and that is where its "
+            f"{old_strategy} settings live. This tool writes campaign-level "
+            f"fields, which Google refuses for such a campaign "
+            f"(BIDDING_STRATEGY_AND_BUDGET_MUST_BE_ALIGNED). To change the "
+            f"shared ceiling, use "
+            f"bidding_strategies.update_portfolio_bid_ceiling. To give this "
+            f"campaign its own strategy instead, use "
+            f"bidding_strategies.detach_campaign_from_portfolio, which "
+            f"clears the portfolio and sets the new strategy in one "
+            f"operation. bidding_strategies.list_bidding_strategies shows "
+            f"which campaigns are in this position."
+        )
 
     if _campaign_is_serving(current[0]) and not confirm_spend:
         raise SpendConfirmationRequired(
@@ -1614,97 +1643,16 @@ def update_bid_strategy(
     campaign = operation.update
     campaign.resource_name = service.campaign_path(customer_id, campaign_id)
 
-    # The update mask has to name a LEAF field: masking the strategy message
-    # itself is rejected with FIELD_HAS_SUBFIELDS. For the strategies that
-    # carry no settings, mask a leaf we deliberately leave unset, which both
-    # selects the strategy and clears any stale value on it.
-    if strategy == "MANUAL_CPC":
-        campaign.manual_cpc.enhanced_cpc_enabled = False
-        paths = ["manual_cpc.enhanced_cpc_enabled"]
-    elif strategy == "MAXIMIZE_CLICKS":
-        client.copy_from(
-            campaign.target_spend, client.get_type("TargetSpend")
-        )
-        if cpc_bid_ceiling is not None:
-            campaign.target_spend.cpc_bid_ceiling_micros = _to_micros(
-                cpc_bid_ceiling
-            )
-        paths = ["target_spend.cpc_bid_ceiling_micros"]
-    elif strategy == "MAXIMIZE_CONVERSIONS":
-        client.copy_from(
-            campaign.maximize_conversions,
-            client.get_type("MaximizeConversions"),
-        )
-        paths = ["maximize_conversions.target_cpa_micros"]
-    elif strategy == "TARGET_CPA":
-        if target_cpa is None:
-            raise ValueError("TARGET_CPA requires target_cpa.")
-        # Target CPA is no longer a strategy of its own: it is Maximize
-        # Conversions with a target. The standalone TargetCpa is rejected on
-        # Search campaigns with OPERATION_NOT_PERMITTED_FOR_CONTEXT.
-        campaign.maximize_conversions.target_cpa_micros = _to_micros(
-            target_cpa
-        )
-        paths = ["maximize_conversions.target_cpa_micros"]
-    elif strategy == "TARGET_ROAS":
-        if target_roas is None:
-            raise ValueError("TARGET_ROAS requires target_roas.")
-        # Likewise: Target ROAS is Maximize Conversion Value with a target.
-        campaign.maximize_conversion_value.target_roas = target_roas
-        paths = ["maximize_conversion_value.target_roas"]
-    elif strategy == "TARGET_IMPRESSION_SHARE":
-        if (
-            impression_share_location is None
-            or impression_share_percent is None
-            or cpc_bid_ceiling is None
-        ):
-            raise ValueError(
-                "TARGET_IMPRESSION_SHARE requires impression_share_location, "
-                "impression_share_percent and cpc_bid_ceiling. The ceiling is "
-                "required by Google, not by this tool: without it the "
-                "strategy pays whatever holding the position costs."
-            )
-        location = impression_share_location.upper()
-        if location not in _IMPRESSION_SHARE_LOCATIONS:
-            raise ValueError(
-                f"impression_share_location must be one of "
-                f"{sorted(_IMPRESSION_SHARE_LOCATIONS)}, not "
-                f"{impression_share_location!r}."
-            )
-        if not 1 <= impression_share_percent <= 100:
-            raise ValueError(
-                "impression_share_percent is a percentage and must be "
-                "between 1 and 100."
-            )
-        campaign.target_impression_share.location = getattr(
-            client.enums.TargetImpressionShareLocationEnum, location
-        )
-        # Google expresses this share in micros of a whole, so 100% is
-        # 1_000_000 and 1% is 10_000 -- not the money micros used elsewhere.
-        campaign.target_impression_share.location_fraction_micros = int(
-            round(impression_share_percent * 10_000)
-        )
-        campaign.target_impression_share.cpc_bid_ceiling_micros = _to_micros(
-            cpc_bid_ceiling
-        )
-        paths = [
-            "target_impression_share.location",
-            "target_impression_share.location_fraction_micros",
-            "target_impression_share.cpc_bid_ceiling_micros",
-        ]
-    else:
-        raise ValueError(f"Unknown bidding strategy: {bidding_strategy}")
-
-    if cpc_bid_ceiling is not None and strategy in (
-        "MANUAL_CPC",
-        "MAXIMIZE_CONVERSIONS",
-        "TARGET_CPA",
-        "TARGET_ROAS",
-    ):
-        raise ValueError(
-            f"{strategy} has no cpc_bid_ceiling. Only MAXIMIZE_CLICKS and "
-            f"TARGET_IMPRESSION_SHARE accept one."
-        )
+    paths = _bidding.apply_campaign_scheme(
+        client,
+        campaign,
+        strategy,
+        target_cpa=target_cpa,
+        target_roas=target_roas,
+        impression_share_location=impression_share_location,
+        impression_share_percent=impression_share_percent,
+        cpc_bid_ceiling=cpc_bid_ceiling,
+    )
 
     client.copy_from(
         operation.update_mask, field_mask_pb2.FieldMask(paths=paths)
@@ -1721,6 +1669,8 @@ def update_bid_strategy(
             f"""
             SELECT campaign.id, campaign.name, campaign.status,
                    campaign.bidding_strategy_type,
+                   campaign.bidding_strategy,
+                   campaign.bidding_strategy_system_status,
                    campaign.target_spend.cpc_bid_ceiling_micros,
                    campaign.target_impression_share.location,
                    campaign.target_impression_share.location_fraction_micros,

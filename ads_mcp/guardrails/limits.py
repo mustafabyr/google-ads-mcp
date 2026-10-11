@@ -92,10 +92,20 @@ _BUILTIN_DEFAULTS = {
 }
 
 # Fields on a change that carry a cost-per-click ceiling, in micros.
+# The first three are campaign and criterion level. The rest exist only on
+# a PORTFOLIO bidding_strategy, whose scheme carries a ceiling even for the
+# conversion-based types that reject one on a campaign -- miss them and a
+# portfolio ceiling could be raised past max_cpc_ceiling_try with nothing
+# refusing it. Keep this list and
+# ads_mcp/tools/_bidding.PORTFOLIO_CEILING_PATHS in step.
 _CPC_FIELDS = (
     "cpc_bid_micros",
     "target_spend.cpc_bid_ceiling_micros",
     "target_impression_share.cpc_bid_ceiling_micros",
+    "maximize_conversions.cpc_bid_ceiling_micros",
+    "maximize_conversion_value.cpc_bid_ceiling_micros",
+    "target_cpa.cpc_bid_ceiling_micros",
+    "target_roas.cpc_bid_ceiling_micros",
 )
 
 

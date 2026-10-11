@@ -126,7 +126,11 @@ TOOL_CLASSES: Dict[str, str] = {
     "extensions.add_structured_snippets": SPEND,
     "extensions.list_campaign_extensions": READ,
     "extensions.remove_campaign_extension": DESTRUCTIVE,
+    "extensions.list_account_extensions": READ,
+    "extensions.remove_account_extension": DESTRUCTIVE,
     "extensions.add_call_extension": SPEND,
+    "extensions.add_price_asset": SPEND,
+    "extensions.add_image_assets": SPEND,
     "extensions.update_call_extension": SPEND,
     "extensions.list_location_asset_sets": READ,
     "extensions.attach_location_asset_set": SPEND,
@@ -168,6 +172,11 @@ TOOL_CLASSES: Dict[str, str] = {
     "shared_sets.detach_negative_keyword_list": DESTRUCTIVE,
     "shared_sets.remove_negative_keyword_list": DESTRUCTIVE,
     "shared_sets.remove_terms": DESTRUCTIVE,
+    # --- bidding strategies (portfolio / shared) ----------------------------
+    "bidding_strategies.list_bidding_strategies": READ,
+    "bidding_strategies.update_portfolio_bid_ceiling": SPEND,
+    "bidding_strategies.detach_campaign_from_portfolio": SPEND,
+    "bidding_strategies.attach_campaign_to_portfolio": SPEND,
     # --- negatives (pure functions, no API) ---------------------------------
     "negatives.expand_turkish": READ,
     # --- targeting ----------------------------------------------------------
@@ -226,6 +235,10 @@ DIRECTIONAL: FrozenSet[str] = frozenset(
         "campaigns.set_campaign_languages",
         "adgroups.update_ad_group_bid",
         "adgroups.update_keyword",
+        # The same tool lowers a portfolio ceiling one day and raises it
+        # the next; the ceiling leaf is in direction.py's _BID_FIELDS, so
+        # a decrease routes PROTECTIVE exactly as it does on a campaign.
+        "bidding_strategies.update_portfolio_bid_ceiling",
     }
 )
 

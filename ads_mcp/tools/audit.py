@@ -59,6 +59,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
+from ads_mcp.tools import _bidding
 
 audit_mcp = FastMCP("audit")
 
@@ -428,6 +429,8 @@ def _check_campaigns(
         SELECT campaign.id, campaign.name, campaign.status,
                campaign.advertising_channel_type,
                campaign.bidding_strategy_type,
+               campaign.bidding_strategy,
+               campaign.bidding_strategy_system_status,
                campaign.target_spend.cpc_bid_ceiling_micros,
                campaign.target_impression_share.location,
                campaign.target_impression_share.location_fraction_micros,
@@ -450,6 +453,8 @@ def _check_campaigns(
     starved = []
     thin_is = []
     no_ceiling = []
+    on_portfolio = []
+    system_status = []
     tis_stuck = []
     partners = []
     display = []
@@ -481,12 +486,43 @@ def _check_campaigns(
         if geo == "PRESENCE_OR_INTEREST" and str(c["id"]) not in brand:
             interest.append(name)
 
+        # A campaign can sit on a PORTFOLIO (shared) bidding strategy,
+        # and then NONE of its bidding settings are on the campaign:
+        # campaign.target_spend.cpc_bid_ceiling_micros reads 0 because
+        # the ceiling is on the strategy. Reading that 0 as "no ceiling"
+        # is how this audit once told an operator to run
+        # update_bid_strategy on such a campaign, which Google refuses
+        # with BIDDING_STRATEGY_AND_BUDGET_MUST_BE_ALIGNED. Those
+        # campaigns belong to _check_bid_strategies, not here.
+        portfolio = str(c.get("bidding_strategy") or "")
+        if portfolio:
+            on_portfolio.append(
+                {
+                    "campaign": name,
+                    "bidding": bidding,
+                    "bidding_strategy_id": portfolio.rsplit("/", 1)[-1],
+                }
+            )
+
         # Maximize Clicks is TARGET_SPEND underneath. With no ceiling it
         # pays whatever the auction asks for a click.
-        if bidding == "TARGET_SPEND":
+        if bidding == "TARGET_SPEND" and not portfolio:
             ceiling = int((c.get("target_spend") or {}).get("cpc_bid_ceiling_micros") or 0)
             if not ceiling:
                 no_ceiling.append(name)
+
+        # Google fills this in for free and almost nobody reads it.
+        meaning = _bidding.describe_system_status(
+            _enum(c.get("bidding_strategy_system_status"))
+        )
+        if meaning:
+            system_status.append(
+                {
+                    "campaign": name,
+                    "status": _enum(c.get("bidding_strategy_system_status")),
+                    "means": meaning,
+                }
+            )
 
         rank_lost = float(m.get("search_rank_lost_impression_share") or 0)
         budget_lost = float(m.get("search_budget_lost_impression_share") or 0)
@@ -577,6 +613,36 @@ def _check_campaigns(
             "update_bid_strategy(MAXIMIZE_CLICKS, cpc_bid_ceiling=...).",
             evidence=no_ceiling,
         )
+    if on_portfolio:
+        f.add(
+            NOTE,
+            "bidding",
+            f"{len(on_portfolio)} live campaign(s) take their bidding from "
+            f"a portfolio (shared) strategy.",
+            "Their ceilings and targets are NOT on the campaign, so the "
+            "campaign-level numbers in this report read as zero and "
+            "update_bid_strategy cannot write them. Read "
+            "list_bidding_strategies and change them with "
+            "update_portfolio_bid_ceiling.",
+            evidence=on_portfolio[:8],
+        )
+    if system_status:
+        misconfigured = [
+            x for x in system_status if x["status"].startswith("MISCONFIGURED")
+        ]
+        f.add(
+            CRITICAL if misconfigured else WARNING,
+            "bidding",
+            f"Google reports a bidding problem on {len(system_status)} live "
+            f"campaign(s) in campaign.bidding_strategy_system_status.",
+            "This is Google's own verdict on the strategy, not an "
+            "inference. MISCONFIGURED_* means the strategy cannot do its "
+            "job at all (a conversion-based strategy with no usable "
+            "conversion type is optimising towards nothing); LIMITED_BY_* "
+            "names what is holding it back, and LIMITED_BY_CPC_BID_CEILING "
+            "means the ceiling rather than the budget is the limit.",
+            evidence=system_status[:8],
+        )
     if tis_stuck:
         f.add(
             WARNING,
@@ -613,6 +679,126 @@ def _check_campaigns(
         )
 
     return {"live_campaigns": live}
+
+
+def _check_bid_strategies(cid: str, f: _Findings) -> None:
+    """Portfolio (shared) bidding strategies: the settings nobody can see.
+
+    Every check here has the same live account behind it. A Maximize
+    Conversions portfolio strategy, aligned to a shared budget, carried
+    two campaigns; its own ceiling was 0 and Google had been reporting
+    MISCONFIGURED_CONVERSION_TYPES on both for months. Nothing in a
+    campaign report, a structure report or this audit said so, because
+    every one of them read the campaign and the settings were not on the
+    campaign.
+    """
+    rows = _rows(
+        cid,
+        """
+        SELECT bidding_strategy.id, bidding_strategy.name,
+               bidding_strategy.type, bidding_strategy.status,
+               bidding_strategy.aligned_campaign_budget_id,
+               bidding_strategy.campaign_count,
+               bidding_strategy.non_removed_campaign_count,
+               bidding_strategy.target_spend.cpc_bid_ceiling_micros,
+               bidding_strategy.target_impression_share.cpc_bid_ceiling_micros,
+               bidding_strategy.maximize_conversions.cpc_bid_ceiling_micros,
+               bidding_strategy.maximize_conversion_value.cpc_bid_ceiling_micros,
+               bidding_strategy.target_cpa.cpc_bid_ceiling_micros,
+               bidding_strategy.target_roas.cpc_bid_ceiling_micros
+        FROM bidding_strategy
+        WHERE bidding_strategy.status != 'REMOVED'
+        """,
+    )
+    if not rows:
+        return
+
+    no_ceiling = []
+    aligned = []
+    single = []
+    empty = []
+    for row in rows:
+        strategy = row.get("bidding_strategy") or {}
+        kind = _bidding.read_type(strategy)
+        name = strategy.get("name")
+        used = int(strategy.get("non_removed_campaign_count") or 0)
+        path = _bidding.PORTFOLIO_CEILING_PATHS.get(kind)
+        ceiling = 0
+        if path:
+            block, leaf = path.split(".", 1)
+            ceiling = int((strategy.get(block) or {}).get(leaf) or 0)
+        entry = {
+            "strategy": name,
+            "bidding_strategy_id": str(strategy.get("id") or ""),
+            "type": kind,
+            "campaigns": used,
+        }
+        if path and not ceiling and used:
+            no_ceiling.append(entry)
+        if int(strategy.get("aligned_campaign_budget_id") or 0):
+            aligned.append(
+                dict(
+                    entry,
+                    aligned_campaign_budget_id=str(
+                        strategy["aligned_campaign_budget_id"]
+                    ),
+                )
+            )
+        if used == 1:
+            single.append(entry)
+        if not used:
+            empty.append(entry)
+
+    if no_ceiling:
+        f.add(
+            WARNING,
+            "bidding",
+            f"{len(no_ceiling)} portfolio bidding strategy(ies) carry no "
+            f"CPC ceiling.",
+            "A ceiling of 0 on a strategy means no ceiling: it pays "
+            "whatever a click costs in the auction, for every campaign on "
+            "it. Set one with update_portfolio_bid_ceiling -- the "
+            "campaign-level tool cannot reach it.",
+            evidence=no_ceiling,
+        )
+    if aligned:
+        f.add(
+            NOTE,
+            "bidding",
+            f"{len(aligned)} portfolio strategy(ies) are aligned to a "
+            f"shared campaign budget.",
+            "Google keeps the two together: every campaign on the strategy "
+            "uses that budget and every campaign on that budget uses the "
+            "strategy, so neither can be changed campaign by campaign. "
+            "Moving one campaign out needs "
+            "detach_campaign_from_portfolio with either its own budget or "
+            "an explicit unalign.",
+            evidence=aligned,
+        )
+    if single:
+        f.add(
+            NOTE,
+            "bidding",
+            f"{len(single)} portfolio strategy(ies) carry a single "
+            f"campaign.",
+            "A shared strategy with one campaign on it gains nothing from "
+            "being shared and costs the campaign its own settings: the "
+            "ceiling cannot be changed campaign by campaign and every "
+            "campaign-level bidding tool refuses. Consider moving it onto "
+            "its own strategy. (Practice, not a Google rule.)",
+            evidence=single,
+        )
+    if empty:
+        f.add(
+            NOTE,
+            "bidding",
+            f"{len(empty)} portfolio strategy(ies) have no live campaign "
+            f"on them.",
+            "They change nothing while they sit there, but they are the "
+            "ones an operator picks by mistake. Remove them in the "
+            "interface if they are finished with.",
+            evidence=empty,
+        )
 
 
 def _check_ads(cid: str, f: _Findings) -> None:
@@ -1326,6 +1512,80 @@ def _check_wasted_spend(cid: str, f: _Findings, min_cost: float) -> None:
 # --------------------------------------------------------------------------
 
 
+def _check_inherited_account_extensions(cid: str, f: _Findings) -> None:
+    """Account-level sitelinks/callouts that live campaigns silently inherit.
+
+    Found live (Oct 2026): two new campaigns launched without sitelinks of
+    their own would have shown account-level sitelinks carrying forbidden
+    claims and 301-redirected URLs. The campaign's own extension list looked
+    clean; only the account level showed them.
+    """
+    links = _rows(
+        cid,
+        """
+        SELECT customer_asset.field_type, customer_asset.status, asset.id,
+               asset.sitelink_asset.link_text, asset.callout_asset.callout_text,
+               asset.final_urls
+        FROM customer_asset
+        WHERE customer_asset.field_type IN ('SITELINK', 'CALLOUT')
+          AND customer_asset.status = 'ENABLED'
+        """,
+    )
+    if not links:
+        return
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for r in links:
+        ftype = _enum((r.get("customer_asset") or {}).get("field_type"))
+        asset = r.get("asset") or {}
+        text = ((asset.get("sitelink_asset") or {}).get("link_text")
+                or (asset.get("callout_asset") or {}).get("callout_text"))
+        by_type.setdefault(ftype, []).append(
+            {"asset_id": asset.get("id"), "text": text,
+             "final_urls": asset.get("final_urls") or None}
+        )
+    campaigns = _rows(
+        cid,
+        """
+        SELECT campaign.id, campaign.name, campaign.status
+        FROM campaign
+        WHERE campaign.status = 'ENABLED'
+          AND campaign.advertising_channel_type = 'SEARCH'
+        """,
+    )
+    own = _rows(
+        cid,
+        """
+        SELECT campaign.id, campaign_asset.field_type, campaign_asset.status
+        FROM campaign_asset
+        WHERE campaign_asset.field_type IN ('SITELINK', 'CALLOUT')
+          AND campaign_asset.status = 'ENABLED'
+        """,
+    )
+    has_own = {
+        (str((r.get("campaign") or {}).get("id")),
+         _enum((r.get("campaign_asset") or {}).get("field_type")))
+        for r in own
+    }
+    for ftype, assets in sorted(by_type.items()):
+        inheriting = [
+            c["campaign"].get("name") for c in campaigns
+            if (str(c["campaign"].get("id")), ftype) not in has_own
+        ]
+        if not inheriting:
+            continue
+        f.add(
+            WARNING,
+            "extensions",
+            f"{len(inheriting)} live search campaign(s) inherit "
+            f"{len(assets)} account-level {ftype.lower()}(s).",
+            "A campaign with no extension of this type of its own shows the "
+            "account-level ones, and its own extension list looks empty. "
+            "Read them with list_account_extensions: give the campaign its "
+            "own, or unlink stale ones with remove_account_extension.",
+            evidence={"campaigns": inheriting, "account_assets": assets},
+        )
+
+
 def _audit_account(
     customer_id: str,
     min_wasted_cost: float = 50.0,
@@ -1372,9 +1632,11 @@ def _audit_account(
     conversions = run("conversions", _check_conversions, cid, f, lead_contract) or {}
     campaigns = run("campaigns", _check_campaigns, cid, f, brand_campaign_ids) or {}
     run("ads", _check_ads, cid, f)
+    run("bid_strategies", _check_bid_strategies, cid, f)
     run("negatives", _check_negatives, cid, f)
     run("ad_group_spend", _check_ad_group_spend, cid, f, min_wasted_cost)
     run("call_extensions", _check_call_extensions, cid, f)
+    run("account_extensions", _check_inherited_account_extensions, cid, f)
     run("auto_apply", _check_auto_apply, cid, f)
     run("unlogged_changes", _check_unlogged_changes, cid, f)
     run("keyword_overlap", _check_keyword_overlap, cid, f)

@@ -89,6 +89,7 @@ _COLLECTIONS = {
     "campaign_shared_set": ("campaignSharedSets", "campaign"),
     "asset": ("assets", None),
     "campaign_asset": ("campaignAssets", "campaign"),
+    "customer_asset": ("customerAssets", None),
     "campaign_asset_set": ("campaignAssetSets", "campaign"),
     "conversion_action": ("conversionActions", None),
     "label": ("labels", None),
@@ -100,6 +101,7 @@ _COLLECTIONS = {
     "asset_group_asset": ("assetGroupAssets", "asset_group"),
     "ad": ("ads", None),
     "campaign_conversion_goal": ("campaignConversionGoals", "campaign"),
+    "bidding_strategy": ("biddingStrategies", None),
 }
 
 # Longer strings than this in a rendered operation are replaced by a

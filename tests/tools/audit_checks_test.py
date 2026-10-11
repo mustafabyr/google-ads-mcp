@@ -106,6 +106,109 @@ class TestBiddingChecks(AuditCase):
         self.assertTrue(any("search partners" in t for t in titles), titles)
 
 
+class TestPortfolioBidStrategyChecks(AuditCase):
+    """One live account: a Maximize Conversions portfolio strategy, aligned
+    to a shared budget, no ceiling, MISCONFIGURED_CONVERSION_TYPES on both
+    campaigns -- and a campaign-level audit that read the campaign's own
+    (empty) ceiling and told the operator to run a tool Google refuses."""
+
+    STRATEGY = f"customers/{CID}/biddingStrategies/11215843012"
+
+    def _strategy(self, kind="MAXIMIZE_CONVERSIONS", aligned=13886713159,
+                  ceiling=0, used=2):
+        strategy = {"resource_name": self.STRATEGY, "id": 11215843012,
+                    "name": "Portfolio", "status": "ENABLED", "type_": kind,
+                    "aligned_campaign_budget_id": aligned,
+                    "campaign_count": used,
+                    "non_removed_campaign_count": used}
+        if kind == "MAXIMIZE_CONVERSIONS":
+            strategy["maximize_conversions"] = {
+                "cpc_bid_ceiling_micros": ceiling
+            }
+        return row(bidding_strategy=strategy)
+
+    def test_a_campaign_on_a_portfolio_is_not_called_ceiling_less(self):
+        """The campaign's own ceiling reads 0 because it is somewhere else."""
+        campaign = _campaign(ceiling=0)
+        campaign.campaign.bidding_strategy = self.STRATEGY
+        fake = (self.fake()
+                .on("campaign.target_spend.cpc_bid_ceiling_micros", [campaign])
+                .on("FROM bidding_strategy", [self._strategy()]))
+        titles = _titles(self.run_audit(fake))
+        self.assertFalse(
+            any("Maximize Clicks campaign(s) have no CPC ceiling" in t
+                for t in titles), titles)
+        self.assertTrue(
+            any("take their bidding from a portfolio" in t for t in titles),
+            titles)
+
+    def test_googles_own_verdict_is_reported(self):
+        campaign = _campaign(ceiling=1)
+        campaign.campaign.bidding_strategy_system_status = (
+            "MISCONFIGURED_CONVERSION_TYPES"
+        )
+        fake = (self.fake()
+                .on("campaign.target_spend.cpc_bid_ceiling_micros", [campaign])
+                .on("FROM bidding_strategy", []))
+        result = self.run_audit(fake)
+        finding = next(f for f in result["findings"]
+                       if "bidding_strategy_system_status" in f["finding"])
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["evidence"][0]["status"],
+                         "MISCONFIGURED_CONVERSION_TYPES")
+        self.assertIn("optimising towards nothing",
+                      finding["evidence"][0]["means"])
+
+    def test_portfolio_without_a_ceiling_and_its_alignment(self):
+        fake = (self.fake()
+                .on("campaign.target_spend.cpc_bid_ceiling_micros",
+                    [_campaign(ceiling=1)])
+                .on("FROM bidding_strategy", [self._strategy()]))
+        titles = _titles(self.run_audit(fake))
+        self.assertTrue(
+            any("portfolio bidding strategy(ies) carry no CPC ceiling" in t
+                for t in titles), titles)
+        self.assertTrue(
+            any("aligned to a shared campaign budget" in t for t in titles),
+            titles)
+
+    def test_a_ceiling_on_the_strategy_passes(self):
+        fake = (self.fake()
+                .on("campaign.target_spend.cpc_bid_ceiling_micros",
+                    [_campaign(ceiling=1)])
+                .on("FROM bidding_strategy",
+                    [self._strategy(aligned=0, ceiling=45_000_000)]))
+        titles = _titles(self.run_audit(fake))
+        self.assertFalse(any("portfolio bidding strategy(ies) carry no" in t
+                             for t in titles), titles)
+        self.assertFalse(any("aligned to a shared" in t for t in titles))
+
+    def test_single_campaign_and_empty_strategies_are_notes(self):
+        fake = (self.fake()
+                .on("campaign.target_spend.cpc_bid_ceiling_micros",
+                    [_campaign(ceiling=1)])
+                .on("FROM bidding_strategy",
+                    [self._strategy(aligned=0, ceiling=45_000_000, used=1),
+                     self._strategy(aligned=0, ceiling=45_000_000, used=0)]))
+        titles = _titles(self.run_audit(fake))
+        self.assertTrue(any("carry a single campaign" in t for t in titles),
+                        titles)
+        self.assertTrue(any("no live campaign on them" in t for t in titles),
+                        titles)
+
+    def test_the_check_never_breaks_the_audit(self):
+        """No bidding_strategy rows at all is the common case."""
+        fake = (self.fake()
+                .on("campaign.target_spend.cpc_bid_ceiling_micros",
+                    [_campaign(ceiling=1)])
+                .on("FROM bidding_strategy", []))
+        result = self.run_audit(fake)
+        self.assertNotIn(
+            "bid_strategies",
+            [c["check"] for c in result.get("checks_failed", [])],
+        )
+
+
 class TestConversionChecks(AuditCase):
     def _goals(self, biddable):
         return [row(customer_conversion_goal={"category": c, "origin": "WEBSITE", "biddable": b})

@@ -37,6 +37,14 @@ _BID_FIELDS = (
     "target_spend.cpc_bid_ceiling_micros",
     "target_impression_share.cpc_bid_ceiling_micros",
     "maximize_conversions.target_cpa_micros",
+    # Portfolio (shared) bidding_strategy schemes.
+    "maximize_conversions.cpc_bid_ceiling_micros",
+    "maximize_conversion_value.cpc_bid_ceiling_micros",
+    "maximize_conversion_value.target_roas",
+    "target_cpa.target_cpa_micros",
+    "target_cpa.cpc_bid_ceiling_micros",
+    "target_roas.target_roas",
+    "target_roas.cpc_bid_ceiling_micros",
 )
 
 
