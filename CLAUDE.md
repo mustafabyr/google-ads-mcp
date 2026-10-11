@@ -444,6 +444,24 @@ account behind it, and none of them were invented from a best-practices
 list. Keep it that way; a checklist padded with plausible-sounding
 checks stops being read.
 
+## Branches and releases
+
+- `main` is the version that runs: the local MCP server is started from a
+  `main` checkout, and the Cloud Run deploy builds from `main`. Never commit
+  work in progress to it.
+- New features and fixes go on their own branch (`mdk/<short-name>`), branched
+  from `main`.
+- A branch is merged into `main` only after it is verified: the unit tests
+  pass (`pytest`; the tests that need real credentials are the only accepted
+  failures) and the new tools have been exercised once against a live account
+  through the plan/apply flow, with the result read back.
+- Merge with `git merge --no-ff` (or a GitHub pull request) so each release
+  is one visible merge commit on `main` and can be reverted as a unit.
+- After merging, switch the local checkout back to `main` and restart the
+  Claude desktop app so the server loads the merged code.
+- Upstream (google-marketing-solutions/google_ads_mcp) changes come in on a
+  branch too, never straight onto `main`.
+
 ## Still to build
 
 - Deploy to Cloud Run: the code, the scripts and the README are in `deploy/`;
