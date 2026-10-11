@@ -37,3 +37,18 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 .nox/
+# Credentials — this repo is public. Never commit these.
+google-ads.yaml
+.env
+.env.*
+client_secret*.json
+*-service-account*.json
+credentials.json
+token.json
+.DS_Store
+
+# Per-account spending ceilings: private, per client. Only the example ships.
+limits.yaml
+
+# Local scratch output of AI sessions
+Claude outputs/

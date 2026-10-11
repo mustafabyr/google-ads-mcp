@@ -7,3 +7,19 @@ namespaces:
   customers: true
   search: true
   metadata: true
+  campaigns: true
+  adgroups: true
+  conversions: true
+  extensions: true
+  reports: true
+  keyword_research: true
+  pmax: true
+  campaign_types: true
+  shared_sets: true
+  targeting: true
+  agency: true
+  experiments: true
+  audit: true
+  plans: true
+  bidding_strategies: true
+  negatives: true

@@ -6,7 +6,10 @@ license = "Apache-2.0"
 dependencies = [
     "google-ads>=31.2.0",
     "mcp[cli]>=1.2.0",
-    "fastmcp>=3.2.0"
+    "fastmcp>=3.2.0",
+    "pyyaml>=6.0",
+    # Europe/Istanbul in the audit log on images without a tz database.
+    "tzdata>=2024.1"
 ]
 
 description = "MCP Server for Google Ads, depends on Google Ads API."
@@ -27,6 +30,11 @@ dev = [
 firestore = [
     # 0.4.5 is the first release exposing the Firestore sanitization strategies.
     "py-key-value-aio[firestore] >=0.4.5, <0.5.0"
+]
+cloud = [
+    # Plans, the audit log, the quota count and the limits file in GCS on
+    # Cloud Run (GOOGLE_ADS_MCP_*_GCS_* variables).
+    "google-cloud-storage>=2.10"
 ]
 
 [project.urls]

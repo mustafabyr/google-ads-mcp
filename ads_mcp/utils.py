@@ -29,6 +29,7 @@ from google.ads.googleads.v25.services.services.google_ads_service import (
 from google.ads.googleads.util import get_nested_attr
 import google.auth
 from ads_mcp.mcp_header_interceptor import MCPHeaderInterceptor
+from ads_mcp.guardrails import session as _session
 import os
 import importlib.resources
 import contextlib
@@ -116,9 +117,12 @@ def _get_googleads_client() -> GoogleAdsClient:
 
 
 def get_googleads_service(serviceName: str) -> GoogleAdsServiceClient:
-    return _get_googleads_client().get_service(
+    service = _get_googleads_client().get_service(
         serviceName, interceptors=[MCPHeaderInterceptor()]
     )
+    # Inside a write session (see ads_mcp/guardrails/session.py) the tool
+    # gets a proxy that records reads and captures or forwards writes.
+    return _session.wrap_service(service, serviceName)
 
 
 def get_googleads_type(typeName: str):

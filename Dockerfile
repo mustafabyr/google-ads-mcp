@@ -10,9 +10,10 @@ WORKDIR /app
 # Copy the project files into the container
 COPY . .
 
-# Install the project and its dependencies
+# Install the project and its dependencies, including the GCS backends the
+# guardrails use on Cloud Run (plans, audit log, quota, limits).
 # We use --system to install into the system Python environment in the container
-RUN uv pip install --system .
+RUN uv pip install --system ".[cloud]"
 
 # Expose port 8080 (default for Cloud Run)
 EXPOSE 8080

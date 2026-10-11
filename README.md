@@ -4,6 +4,33 @@ This repo contains the source code for running an
 [MCP](https://modelcontextprotocol.io) server that interacts with the
 [Google Ads API](https://developers.google.com/google-ads/api).
 
+## This fork: write tools behind a safety layer
+
+This is the MD Kampüs fork. On top of Google's read tools it adds write
+tools for Search campaigns, ad groups, ads, keywords, negatives, extensions,
+conversions, experiments, Performance Max and Demand Gen, plus reports and
+an agency audit -- 115 tools -- every one of them behind one safety layer
+(`ads_mcp/guardrails/`):
+
+- **Every tool has a class**: READ, PROTECTIVE, SPEND or DESTRUCTIVE. The
+  class sets the MCP annotations, so a client can allow READ and PROTECTIVE
+  tools blanket and gate the rest. A tool without a class does not mount.
+- **SPEND and DESTRUCTIVE tools return a plan instead of writing**: before
+  and after values, the money, the limits verdict, a rollback recipe.
+  `plans_apply_plan` writes it -- after re-reading the objects and refusing
+  if the account changed in between. Once only; 30 minutes.
+- **No ceiling, no write.** Per-account limits live in a private YAML file
+  (`GOOGLE_ADS_MCP_LIMITS_PATH`; shape in
+  `ads_mcp/guardrails/limits.example.yaml`). An account with no row gets no
+  SPEND or DESTRUCTIVE write at all.
+- **Every write leaves a line** in `~/.google-ads-mcp/audit/`, in UTC and
+  Europe/Istanbul; `audit_get_change_log` reads it back.
+- **Over the network, an allow list**: HTTP transport refuses to start
+  without OAuth and `GOOGLE_ADS_MCP_ALLOWED_EMAILS`.
+
+`CLAUDE.md` has the contract and the API traps; `deploy/README.md` the Cloud
+Run setup; `docs/kaynaklar.md` the source of every threshold.
+
 ## Tools
 
 The server uses the
